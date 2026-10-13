@@ -34,30 +34,33 @@ def b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
-def der_integer(data: bytes, offset: int) -> tuple[bytes, int]:
-    if data[offset] != 2:
+def der_value(data: bytes, offset: int, expected_tag: int) -> tuple[bytes, int]:
+    if offset >= len(data) or data[offset] != expected_tag or offset + 1 >= len(data):
         raise GateError("Could not parse the generated RSA public key.")
     length = data[offset + 1]
     start = offset + 2
     if length & 0x80:
         count = length & 0x7F
+        if count == 0 or start + count > len(data):
+            raise GateError("Could not parse the generated RSA public key length.")
         length = int.from_bytes(data[start : start + count], "big")
         start += count
-    value = data[start : start + length].lstrip(b"\x00")
-    return value, start + length
+    end = start + length
+    if end > len(data):
+        raise GateError("Generated RSA public key is truncated.")
+    return data[start:end], end
 
 
 def rsa_jwk(public_der: bytes) -> dict[str, str]:
-    bit_string = public_der.index(b"\x03")
-    length = public_der[bit_string + 1]
-    start = bit_string + 2
-    if length & 0x80:
-        count = length & 0x7F
-        length = int.from_bytes(public_der[start : start + count], "big")
-        start += count
-    sequence = public_der[start + 1 : start + length]
-    modulus, offset = der_integer(sequence, 0)
-    exponent, _ = der_integer(sequence, offset)
+    subject_public_key_info, _ = der_value(public_der, 0, 0x30)
+    _, offset = der_value(subject_public_key_info, 0, 0x30)  # AlgorithmIdentifier
+    bit_string, _ = der_value(subject_public_key_info, offset, 0x03)
+    if not bit_string or bit_string[0] != 0:
+        raise GateError("Generated RSA public key has an invalid BIT STRING.")
+    rsa_sequence, _ = der_value(bit_string, 1, 0x30)
+    modulus, offset = der_value(rsa_sequence, 0, 0x02)
+    exponent, _ = der_value(rsa_sequence, offset, 0x02)
+    modulus = modulus.lstrip(b"\x00")
     return {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "capability", "n": b64url(modulus), "e": b64url(exponent)}
 
 
@@ -189,7 +192,7 @@ def write_override(temp: Path, issuer: str) -> Path:
                 "image": "python:3.13.7-alpine3.22",
                 "command": ["python3", "/fixture/capability_oidc.py"],
                 "volumes": [f"{temp}:/fixture:ro"],
-                "networks": ["backend"],
+                "networks": {"backend": {"aliases": ["oidc"]}},
                 "restart": "no",
             },
             "ui": {"depends_on": {"oidc-fixture": {"condition": "service_started"}}},
