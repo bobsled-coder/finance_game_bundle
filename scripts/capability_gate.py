@@ -478,7 +478,7 @@ def main() -> int:
                 print(f"Capability gate cleanup failed: {error}", file=sys.stderr)
         if args.keep:
             print(f"Kept disposable project {project} and fixture files at {temp} for inspection.")
-        elif not created or project_cleaned:
+        elif (not created or project_cleaned) and not temp_cleaned:
             try:
                 cleanup_temp_directory(temp)
                 temp_cleaned = True
