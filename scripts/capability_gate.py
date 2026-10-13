@@ -194,7 +194,7 @@ def inspect_config(compose: list[str], env: dict[str, str]) -> None:
 def inspect_deployed_pair(compose: list[str], env: dict[str, str], expected: dict[str, str]) -> dict[str, dict[str, object]]:
     deployed: dict[str, dict[str, object]] = {}
     for service in ("migrate", "api", "ui"):
-        container_id = run(compose + ["ps", "-q", service], env=env, capture=True).stdout.strip()
+        container_id = run(compose + ["ps", "--all", "-q", service], env=env, capture=True).stdout.strip()
         if not container_id:
             raise GateError(f"The disposable stack has no container for {service}; cannot verify its source identity.")
         inspected = json.loads(run(["docker", "inspect", container_id], capture=True).stdout)[0]

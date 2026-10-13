@@ -228,7 +228,7 @@ def deployment_up(backup_reference: str, previous_release_reference: str) -> int
     try:
         run(compose + ["up", "--build", "--detach", "--wait"], env=env, capture=True)
         for service in ("migrate", "api", "ui"):
-            container_id = run(compose + ["ps", "-q", service], env=env, capture=True).stdout.strip()
+            container_id = run(compose + ["ps", "--all", "-q", service], env=env, capture=True).stdout.strip()
             if not container_id:
                 raise release_pair.ReleasePairError(f"Compose did not return a container for {service}.")
             inspected = json.loads(run(["docker", "inspect", container_id], env=env, capture=True).stdout)[0]
@@ -259,7 +259,7 @@ def deployment_up(backup_reference: str, previous_release_reference: str) -> int
     except Exception as error:
         observed = {}
         for service in ("migrate", "api", "ui"):
-            container_id = run(compose + ["ps", "-q", service], env=env, check=False, capture=True).stdout.strip()
+            container_id = run(compose + ["ps", "--all", "-q", service], env=env, check=False, capture=True).stdout.strip()
             if not container_id:
                 continue
             inspected_result = run(["docker", "inspect", container_id], env=env, check=False, capture=True)
