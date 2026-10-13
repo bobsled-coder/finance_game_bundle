@@ -46,7 +46,8 @@ empty Compose env file, and validates the resolved config before starting
 containers. Postgres and the API stay private. Its database volume is
 project-scoped. Cleanup checks Compose project labels and runs `down --volumes`
 only for this generated project. `--keep` on the underlying Python command
-leaves the stack running for inspection; normal runs remove their project.
+leaves the stack running and retains the temporary OIDC fixture files for
+inspection; normal runs remove their project and fixture files.
 Evidence is written under `outputs/capability-gates/<project>/` with source
 revisions, artifact IDs and hashes, migration failure output, and bounded
 Compose logs. It never connects to or removes a pre-existing project or

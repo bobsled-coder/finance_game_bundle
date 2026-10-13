@@ -165,7 +165,8 @@ def inspect_config(compose: list[str], env: dict[str, str]) -> None:
         for mount in service.get("volumes", []):
             source = Path(mount.get("source", "")).resolve()
             temp_root = Path(env["CAPABILITY_TEMP_ROOT"]).resolve()
-            unexpected_bind = mount.get("type") == "bind" and (source != temp_root and temp_root not in source.parents or mount.get("target") != "/fixture")
+            allowed_targets = {"/fixture", "/capability-ca.crt"}
+            unexpected_bind = mount.get("type") == "bind" and (source != temp_root and temp_root not in source.parents or mount.get("target") not in allowed_targets)
             if unexpected_bind:
                 raise GateError(f"Refusing unexpected host bind mount in {service_name}: {mount.get('source')} -> {mount.get('target')}")
         if service_name in ("db", "api") and service.get("ports"):
@@ -173,6 +174,45 @@ def inspect_config(compose: list[str], env: dict[str, str]) -> None:
     ui_ports = config["services"]["ui"].get("ports", [])
     if len(ui_ports) != 1 or ui_ports[0].get("host_ip") != "127.0.0.1":
         raise GateError("The only published port must bind the UI to loopback.")
+
+
+def cleanup_project(compose: list[str], env: dict[str, str], project: str, evidence: Path) -> None:
+    containers = run(compose + ["ps", "-aq"], env=env, capture=True).stdout.strip().split()
+    resources = [("container", item, ["docker", "inspect", "-f", "{{ index .Config.Labels \"com.docker.compose.project\" }}", item]) for item in containers]
+    volumes = run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip().split()
+    resources.extend(("volume", item, ["docker", "volume", "inspect", "-f", "{{ index .Labels \"com.docker.compose.project\" }}", item]) for item in volumes)
+    networks = run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip().split()
+    resources.extend(("network", item, ["docker", "network", "inspect", "-f", "{{ index .Labels \"com.docker.compose.project\" }}", item]) for item in networks)
+    for kind, item, inspect in resources:
+        label = run(inspect, capture=True).stdout.strip()
+        if label != project:
+            raise GateError(f"Refusing cleanup: {kind} {item} has unexpected Compose project label {label!r}.")
+    result = run(compose + ["down", "--volumes", "--remove-orphans"], check=False, env=env, capture=True)
+    (evidence / "cleanup.log").write_text(result.stdout or "")
+    if result.returncode:
+        raise GateError(f"Compose cleanup failed ({result.returncode}); see {evidence / 'cleanup.log'}.")
+    leftovers = {
+        "containers": run(compose + ["ps", "-aq"], env=env, capture=True).stdout.strip(),
+        "volumes": run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip(),
+        "networks": run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip(),
+    }
+    if any(leftovers.values()):
+        raise GateError(f"Project cleanup left resources behind: {leftovers}.")
+
+
+def cleanup_temp_directory(temp: Path) -> None:
+    fixture = temp / "fixture"
+    if fixture.exists():
+        for child in fixture.iterdir():
+            if child.is_dir():
+                raise GateError(f"Refusing to remove unexpected nested fixture directory {child}.")
+            child.unlink()
+        fixture.rmdir()
+    for child in temp.iterdir():
+        if child.is_dir():
+            raise GateError(f"Refusing to remove unexpected nested fixture directory {child}.")
+        child.unlink()
+    temp.rmdir()
 
 
 def write_override(temp: Path, issuer: str) -> Path:
@@ -183,15 +223,15 @@ def write_override(temp: Path, issuer: str) -> Path:
                     "OIDC_ISSUER": issuer,
                     "OIDC_AUDIENCE": "finance-game-capability",
                     "OIDC_JWKS_URL": issuer + ".well-known/jwks.json",
-                    "SSL_CERT_FILE": "/fixture/tls.crt",
+                    "SSL_CERT_FILE": "/capability-ca.crt",
                 },
-                "volumes": [f"{temp}:/fixture:ro"],
+                "volumes": [f"{temp / 'fixture' / 'tls.crt'}:/capability-ca.crt:ro"],
                 "depends_on": {"oidc-fixture": {"condition": "service_started"}},
             },
             "oidc-fixture": {
                 "image": "python:3.13.7-alpine3.22",
                 "command": ["python3", "/fixture/capability_oidc.py"],
-                "volumes": [f"{temp}:/fixture:ro"],
+                "volumes": [f"{temp / 'fixture'}:/fixture:ro"],
                 "networks": {"backend": {"aliases": ["oidc"]}},
                 "restart": "no",
             },
@@ -223,23 +263,29 @@ def main() -> int:
         raise GateError("Docker Compose and openssl are required.")
     project = "fgcap-" + uuid.uuid4().hex[:12]
     port = free_port()
-    temp_obj = tempfile.TemporaryDirectory(prefix=project + "-")
-    temp = Path(temp_obj.name)
+    temp = Path(tempfile.mkdtemp(prefix=project + "-"))
     evidence = args.evidence_dir.resolve() if args.evidence_dir else ROOT / "outputs" / "capability-gates" / project
     evidence.mkdir(parents=True, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith("COMPOSE_")}
     env.update({"GO_SOURCE": str(go_path), "UI_SOURCE": str(ui_path), "UI_PORT": str(port), "BIND_ADDRESS": "127.0.0.1", "POSTGRES_PASSWORD": secrets.token_urlsafe(32), "CAPABILITY_TEMP_ROOT": str(temp), "CAPABILITY_PROJECT": project})
     (temp / "tls.key").unlink(missing_ok=True)
     run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(temp / "tls.key"), "-out", str(temp / "tls.crt"), "-subj", "/CN=oidc", "-addext", "subjectAltName=DNS:oidc", "-days", "1"], capture=True)
+    (temp / "tls.crt").chmod(0o644)
     run(["openssl", "genrsa", "-out", str(temp / "signing.key"), "2048"], capture=True)
     run(["openssl", "rsa", "-in", str(temp / "signing.key"), "-pubout", "-outform", "DER", "-out", str(temp / "signing.pub.der")], capture=True)
-    (temp / "jwks.json").write_text(json.dumps({"keys": [rsa_jwk((temp / "signing.pub.der").read_bytes())]}, separators=(",", ":")))
-    shutil.copy2(ROOT / "scripts" / "capability_oidc.py", temp / "capability_oidc.py")
+    fixture_dir = temp / "fixture"
+    fixture_dir.mkdir(mode=0o755)
+    shutil.copy2(temp / "tls.crt", fixture_dir / "tls.crt")
+    shutil.copy2(temp / "tls.key", fixture_dir / "tls.key")
+    (fixture_dir / "tls.key").chmod(0o600)
+    shutil.copy2(ROOT / "scripts" / "capability_oidc.py", fixture_dir / "capability_oidc.py")
+    (fixture_dir / "jwks.json").write_text(json.dumps({"keys": [rsa_jwk((temp / "signing.pub.der").read_bytes())]}, separators=(",", ":")))
     issuer = "https://oidc:8443/"
     override = write_override(temp, issuer)
     compose = compose_command(temp, override, project)
     manifest: dict[str, object] = {"project": project, "uiPort": port, "goSource": go_info, "uiSource": ui_info, "rulePackVersion": RULE_PACK, "fixtureOnly": True, "evidenceDirectory": str(evidence), "phases": []}
     created = False
+    cleanup_attempted = False
     logs: list[str] = []
 
     def phase(name: str, status: str, **details: object) -> None:
@@ -396,7 +442,12 @@ def main() -> int:
         request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
         phase("api-offline-and-recovery", "passed", outageCode=unavailable)
         collect_logs()
-        phase("complete", "passed", cleanup="pending")
+        if args.keep:
+            phase("complete", "passed", cleanup="kept", fixtureDirectory=str(temp))
+        else:
+            cleanup_project(compose, env, project, evidence)
+            cleanup_attempted = True
+            phase("complete", "passed", cleanup="removed")
         print(f"Capability gate passed. Evidence: {evidence}")
         return 0
     except Exception as error:
@@ -405,31 +456,18 @@ def main() -> int:
         print(f"Capability gate failed: {error}\nEvidence: {evidence}", file=sys.stderr)
         return 1
     finally:
-        if created and not args.keep:
-            containers = run(compose + ["ps", "-aq"], check=False, env=env, capture=True).stdout.strip().split()
-            ownership_ok = True
-            for container in containers:
-                labels = run(["docker", "inspect", "-f", "{{ index .Config.Labels \"com.docker.compose.project\" }}", container], check=False, capture=True).stdout.strip()
-                if labels != project:
-                    print(f"Refusing cleanup: container {container} has unexpected project label {labels!r}.", file=sys.stderr)
-                    ownership_ok = False
-            volumes = run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], check=False, capture=True).stdout.strip().split()
-            for volume in volumes:
-                labels = run(["docker", "volume", "inspect", "-f", "{{ index .Labels \"com.docker.compose.project\" }}", volume], check=False, capture=True).stdout.strip()
-                if labels != project:
-                    print(f"Refusing cleanup: volume {volume} has unexpected project label {labels!r}.", file=sys.stderr)
-                    ownership_ok = False
-            networks = run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], check=False, capture=True).stdout.strip().split()
-            for network in networks:
-                labels = run(["docker", "network", "inspect", "-f", "{{ index .Labels \"com.docker.compose.project\" }}", network], check=False, capture=True).stdout.strip()
-                if labels != project:
-                    print(f"Refusing cleanup: network {network} has unexpected project label {labels!r}.", file=sys.stderr)
-                    ownership_ok = False
-            if ownership_ok:
-                run(compose + ["down", "--volumes", "--remove-orphans"], check=False, env=env, capture=True)
+        if created and not args.keep and not cleanup_attempted:
+            try:
+                cleanup_project(compose, env, project, evidence)
+            except Exception as error:
+                print(f"Capability gate cleanup failed: {error}", file=sys.stderr)
         if args.keep:
-            print(f"Kept disposable project {project} for inspection.")
-        temp_obj.cleanup()
+            print(f"Kept disposable project {project} and fixture files at {temp} for inspection.")
+        else:
+            try:
+                cleanup_temp_directory(temp)
+            except Exception as error:
+                print(f"Capability fixture file cleanup failed: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":
