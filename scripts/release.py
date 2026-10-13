@@ -13,7 +13,10 @@ import subprocess
 import sys
 import uuid
 
-import release_pair
+if __package__:
+    from . import release_pair
+else:
+    import release_pair
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,11 +83,13 @@ def read_backup_reference(path_text: str, previous: dict) -> dict:
         raise release_pair.ReleasePairError(f"Cannot read backup reference {path}: {error}") from error
     if not isinstance(value, dict):
         raise release_pair.ReleasePairError("Backup reference must contain a JSON object.")
-    required = ("location", "createdAt", "sha256", "schemaVersion", "releaseId")
+    required = ("location", "createdAt", "sha256", "schemaVersion", "releaseId", "releasePairSha256", "sources")
     if any(value.get(key) in (None, "") for key in required):
-        raise release_pair.ReleasePairError("Backup reference requires location, createdAt, sha256, schemaVersion, and releaseId.")
+        raise release_pair.ReleasePairError("Backup reference requires location, createdAt, sha256, schemaVersion, releaseId, releasePairSha256, and source revisions.")
     if not isinstance(value["sha256"], str) or not BACKUP_SHA.fullmatch(value["sha256"]):
         raise release_pair.ReleasePairError("Backup reference sha256 must be 64 lowercase hexadecimal characters.")
+    if not isinstance(value["releasePairSha256"], str) or not BACKUP_SHA.fullmatch(value["releasePairSha256"]):
+        raise release_pair.ReleasePairError("Backup reference releasePairSha256 must be 64 lowercase hexadecimal characters.")
     try:
         datetime.fromisoformat(str(value["createdAt"]).replace("Z", "+00:00"))
     except ValueError as error:
@@ -93,6 +98,16 @@ def read_backup_reference(path_text: str, previous: dict) -> dict:
         raise release_pair.ReleasePairError("Backup reference releaseId does not match the previous deployment record.")
     if value["schemaVersion"] != previous.get("databaseSchemaVersion"):
         raise release_pair.ReleasePairError("Backup reference schemaVersion does not match the previous deployment record.")
+    if value["releasePairSha256"] != previous.get("releasePairSha256"):
+        raise release_pair.ReleasePairError("Backup reference releasePairSha256 does not match the previous deployment record.")
+    if not isinstance(value["sources"], dict):
+        raise release_pair.ReleasePairError("Backup reference sources must identify the previous Go/API and UI revisions.")
+    for name in ("go", "ui"):
+        source = value["sources"].get(name)
+        if not isinstance(source, dict) or not release_pair.COMMIT.fullmatch(str(source.get("revision", ""))):
+            raise release_pair.ReleasePairError(f"Backup reference needs a full {name.upper()} source revision.")
+        if source["revision"] != previous.get("sources", {}).get(name, {}).get("revision"):
+            raise release_pair.ReleasePairError(f"Backup reference {name.upper()} revision does not match the previous deployment record.")
     return {"path": str(path), **value}
 
 

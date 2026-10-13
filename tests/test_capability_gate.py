@@ -5,12 +5,12 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from scripts import capability_gate
+from scripts import capability_gate, release
 
 
 class InspectConfigTests(unittest.TestCase):
     def inspect(self, *, volume_name: str, network_name: str) -> None:
-        project = "fgcap-test"
+        project = "fgcap-012345abcdef"
         config = {
             "name": project,
             "volumes": {"postgres_data": {"name": volume_name}},
@@ -39,7 +39,7 @@ class InspectConfigTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 0, stdout=json.dumps(config))
         env = {
             "CAPABILITY_PROJECT": project,
-            "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-test",
+            "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-012345abcdef",
             "GO_SOURCE_REVISION": "a" * 40,
             "UI_SOURCE_REVISION": "b" * 40,
         }
@@ -48,20 +48,20 @@ class InspectConfigTests(unittest.TestCase):
 
     def test_accepts_project_scoped_resource_names(self) -> None:
         self.inspect(
-            volume_name="fgcap-test_postgres_data",
-            network_name="fgcap-test_backend",
+            volume_name="fgcap-012345abcdef_postgres_data",
+            network_name="fgcap-012345abcdef_backend",
         )
 
     def test_rejects_globally_named_volume(self) -> None:
         with self.assertRaisesRegex(capability_gate.GateError, "volume"):
-            self.inspect(volume_name="postgres_data", network_name="fgcap-test_backend")
+            self.inspect(volume_name="postgres_data", network_name="fgcap-012345abcdef_backend")
 
     def test_rejects_globally_named_network(self) -> None:
         with self.assertRaisesRegex(capability_gate.GateError, "network"):
-            self.inspect(volume_name="fgcap-test_postgres_data", network_name="backend")
+            self.inspect(volume_name="fgcap-012345abcdef_postgres_data", network_name="backend")
 
     def test_rejects_different_compose_project(self) -> None:
-        with self.assertRaisesRegex(capability_gate.GateError, "expected isolated project"):
+        with self.assertRaisesRegex(capability_gate.GateError, "expected generated project"):
             self.inspect_config_with_project("finance_game_bundle")
 
     def inspect_config_with_project(self, project: str) -> None:
@@ -72,7 +72,7 @@ class InspectConfigTests(unittest.TestCase):
             "services": {"ui": {"volumes": [], "ports": [{"host_ip": "127.0.0.1"}]}},
         }
         result = subprocess.CompletedProcess([], 0, stdout=json.dumps(config))
-        env = {"CAPABILITY_PROJECT": "fgcap-test", "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-test"}
+        env = {"CAPABILITY_PROJECT": "fgcap-012345abcdef", "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-012345abcdef"}
         with patch.object(capability_gate, "run", return_value=result):
             capability_gate.inspect_config(["docker", "compose"], env)
 
@@ -133,7 +133,7 @@ class ComposeBuildFailureTests(unittest.TestCase):
 
 class CleanupOwnershipTests(unittest.TestCase):
     def test_cleanup_removes_only_owned_images_after_compose_resources(self) -> None:
-        project = "fgcap-test"
+        project = "fgcap-012345abcdef"
         compose = ["docker", "compose", "--project-name", project]
         images = capability_gate.capability_images(project)
         present_images = {images[1]}
@@ -179,12 +179,12 @@ class CleanupOwnershipTests(unittest.TestCase):
             evidence = Path(directory)
             with patch.object(capability_gate, "run", side_effect=fake_run):
                 capability_gate.cleanup_project(compose, {}, project, evidence)
-            self.assertEqual((evidence / "cleanup.log").read_text(), "project removed\n")
+            self.assertEqual((evidence / "cleanup-primary.log").read_text(), "project removed\n")
 
         self.assertEqual(removed_images, [images[1]])
 
     def test_refuses_to_remove_project_when_a_container_has_another_label(self) -> None:
-        project = "fgcap-test"
+        project = "fgcap-012345abcdef"
         compose = ["docker", "compose", "--project-name", project]
 
         def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -208,7 +208,7 @@ class CleanupOwnershipTests(unittest.TestCase):
             self.assertEqual(list(evidence.iterdir()), [])
 
     def test_refuses_to_remove_a_capability_image_owned_by_another_project(self) -> None:
-        project = "fgcap-test"
+        project = "fgcap-012345abcdef"
         compose = ["docker", "compose", "--project-name", project]
 
         def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -236,7 +236,7 @@ class CapabilityOverrideTests(unittest.TestCase):
         from tempfile import TemporaryDirectory
 
         with TemporaryDirectory() as directory:
-            project = "fgcap-test"
+            project = "fgcap-012345abcdef"
             override_path = capability_gate.write_override(Path(directory), "https://oidc:8443/", project)
             override = json.loads(override_path.read_text())
 
@@ -245,6 +245,63 @@ class CapabilityOverrideTests(unittest.TestCase):
         for service, image in zip(("migrate", "api", "ui"), capability_gate.capability_images(project)):
             self.assertEqual(override["services"][service]["image"], image)
             self.assertEqual(override["services"][service]["build"]["labels"][capability_gate.IMAGE_LABEL], project)
+
+
+class RecoverySafetyTests(unittest.TestCase):
+    def test_refuses_external_database_volume_before_container_inspection(self) -> None:
+        project = "fgcap-012345abcdef"
+        compose = ["docker", "compose", "--project-name", project]
+        config = {"name": project, "volumes": {"postgres_data": {"name": "live_database", "external": True}}}
+        with patch.object(capability_gate, "run", return_value=subprocess.CompletedProcess(compose, 0, stdout=json.dumps(config))) as mocked:
+            with self.assertRaisesRegex(capability_gate.GateError, "non-disposable volume"):
+                capability_gate.verify_disposable_database(compose, {"CAPABILITY_PROJECT": project})
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_accepts_backup_reference_for_matching_release_and_sources(self) -> None:
+        pair_sha = "a" * 64
+        sources = {"go": {"revision": "b" * 40}, "ui": {"revision": "c" * 40}}
+        previous = {"releaseId": "release-1", "databaseSchemaVersion": 27,
+                    "releasePairSha256": pair_sha, "sources": sources}
+        backup = {"location": "file:///tmp/backup.dump", "createdAt": "2026-10-16T12:00:00Z",
+                  "sha256": "d" * 64, "schemaVersion": 27, "releaseId": "release-1",
+                  "releasePairSha256": pair_sha, "sources": sources}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "backup-reference.json"
+            path.write_text(json.dumps(backup))
+            self.assertEqual(release.read_backup_reference(str(path), previous)["sources"], sources)
+
+    def test_rejects_backup_reference_with_mismatched_source_revision(self) -> None:
+        sources = {"go": {"revision": "b" * 40}, "ui": {"revision": "c" * 40}}
+        previous = {"releaseId": "release-1", "databaseSchemaVersion": 27,
+                    "releasePairSha256": "a" * 64, "sources": sources}
+        backup = {"location": "file:///tmp/backup.dump", "createdAt": "2026-10-16T12:00:00Z",
+                  "sha256": "d" * 64, "schemaVersion": 27, "releaseId": "release-1",
+                  "releasePairSha256": "a" * 64,
+                  "sources": {"go": {"revision": "e" * 40}, "ui": sources["ui"]}}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "backup-reference.json"
+            path.write_text(json.dumps(backup))
+            with self.assertRaisesRegex(release.release_pair.ReleasePairError, "does not match the previous deployment"):
+                release.read_backup_reference(str(path), previous)
+
+    def test_dirty_candidate_fingerprint_includes_untracked_file_contents(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+            (root / "tracked.txt").write_text("base\n")
+            subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "base"], check=True, capture_output=True)
+            (root / "tracked.txt").write_text("candidate\n")
+            untracked = root / "candidate.json"
+            untracked.write_text('{"phase":"one"}\n')
+            first_status, first_digest = capability_gate.bundle_worktree_fingerprint(root)
+            untracked.write_text('{"phase":"two"}\n')
+            second_status, second_digest = capability_gate.bundle_worktree_fingerprint(root)
+        self.assertTrue(first_status)
+        self.assertTrue(second_status)
+        self.assertNotEqual(first_digest, second_digest)
 
 
 if __name__ == "__main__":

@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,8 +24,9 @@ import urllib.request
 import uuid
 
 if __package__:
-    from . import release_pair
+    from . import release, release_pair
 else:
+    import release
     import release_pair
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RULE_PACK = "canadian-planning-rules-test-v1"
 TIMEOUT = 90
 IMAGE_LABEL = "io.bobsled.capability-project"
+DISPOSABLE_PROJECT = re.compile(r"^fgcap-[0-9a-f]{12}$")
 
 
 class GateError(RuntimeError):
@@ -84,6 +90,20 @@ def run(command: list[str], *, check: bool = True, env: dict[str, str] | None = 
     return result
 
 
+def bundle_worktree_fingerprint(root: Path = ROOT) -> tuple[str, str]:
+    status = run(["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"], capture=True).stdout
+    diff = run(["git", "-C", str(root), "diff", "--binary", "HEAD"], capture=True).stdout
+    untracked = run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"], capture=True).stdout
+    digest = hashlib.sha256()
+    digest.update(status.encode())
+    digest.update(diff.encode())
+    for relative in sorted(path for path in untracked.split("\0") if path):
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update((root / relative).read_bytes())
+    return status, digest.hexdigest()
+
+
 def run_compose_build(compose: list[str], env: dict[str, str], evidence: Path) -> None:
     command = compose + ["up", "--build", "--detach", "--wait"]
     result = run(command, check=False, env=env, capture=True)
@@ -121,6 +141,12 @@ def candidate_port() -> int:
     # Select from the dynamic/private range without opening a host socket. The
     # Compose bind is the authoritative collision check and reports the port.
     return 49152 + secrets.randbelow(16384)
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def wait_http(url: str, *, expected: int = 200, headers: dict[str, str] | None = None, timeout: int = TIMEOUT) -> tuple[int, bytes, dict[str, str]]:
@@ -199,15 +225,13 @@ def inspect_config(compose: list[str], env: dict[str, str]) -> None:
     result = run(compose + ["config", "--format", "json"], capture=True, env=env)
     config = json.loads(result.stdout)
     project = env["CAPABILITY_PROJECT"]
-    if config.get("name") != project:
-        raise GateError(
-            f"Compose resolved project name {config.get('name')!r}; expected isolated project {project!r}."
-        )
+    if not DISPOSABLE_PROJECT.fullmatch(project) or config.get("name") != project:
+        raise GateError(f"Refusing non-disposable Compose project {config.get('name')!r}; expected generated project {project!r}.")
     for name, volume in config.get("volumes", {}).items():
-        if volume.get("external") or volume.get("name") not in (None, f"{project}_{name}"):
+        if volume.get("external") or volume.get("driver_opts") or volume.get("name") != f"{project}_{name}":
             raise GateError(f"Refusing non-project-scoped or external volume {name!r}.")
     for name, network in config.get("networks", {}).items():
-        if network.get("external") or network.get("name") not in (None, f"{project}_{name}"):
+        if network.get("external") or network.get("name") != f"{project}_{name}":
             raise GateError(f"Refusing non-project-scoped or external network {name!r}.")
     for service_name, service in config.get("services", {}).items():
         if service.get("container_name"):
@@ -219,7 +243,7 @@ def inspect_config(compose: list[str], env: dict[str, str]) -> None:
             unexpected_bind = mount.get("type") == "bind" and (source != temp_root and temp_root not in source.parents or mount.get("target") not in allowed_targets)
             if unexpected_bind:
                 raise GateError(f"Refusing unexpected host bind mount in {service_name}: {mount.get('source')} -> {mount.get('target')}")
-        if service_name in ("db", "api") and service.get("ports"):
+        if service_name != "ui" and service.get("ports"):
             raise GateError(f"{service_name} must remain private; resolved Compose config publishes a port.")
     api_context = config["services"]["api"].get("build", {}).get("context")
     migrate_context = config["services"]["migrate"].get("build", {}).get("context")
@@ -257,7 +281,65 @@ def inspect_deployed_pair(compose: list[str], env: dict[str, str], expected: dic
     return deployed
 
 
-def cleanup_project(compose: list[str], env: dict[str, str], project: str, evidence: Path) -> None:
+def verify_disposable_database(compose: list[str], env: dict[str, str]) -> None:
+    project = env["CAPABILITY_PROJECT"]
+    if not DISPOSABLE_PROJECT.fullmatch(project):
+        raise GateError(f"Refusing database operation for non-generated project name {project!r}.")
+    config = json.loads(run(compose + ["config", "--format", "json"], env=env, capture=True).stdout)
+    if config.get("name") != project:
+        raise GateError(f"Refusing database operation: Compose resolved project {config.get('name')!r}, expected {project!r}.")
+    volume_config = config.get("volumes", {}).get("postgres_data", {})
+    volume_name = volume_config.get("name")
+    expected_volume = f"{project}_postgres_data"
+    if volume_config.get("external") or volume_config.get("driver_opts") or volume_name != expected_volume:
+        raise GateError(f"Refusing database operation on non-disposable volume {volume_name!r}.")
+    container_id = run(compose + ["ps", "-q", "db"], env=env, capture=True).stdout.strip()
+    if not container_id:
+        raise GateError("Refusing database operation: the disposable project's db container is not running.")
+    inspected = json.loads(run(["docker", "inspect", container_id], capture=True).stdout)[0]
+    labels = inspected.get("Config", {}).get("Labels", {}) or {}
+    if labels.get("com.docker.compose.project") != project or labels.get("com.docker.compose.service") != "db":
+        raise GateError("Refusing database operation: the db container does not belong to this disposable Compose project.")
+    mounts = [mount for mount in inspected.get("Mounts", []) if mount.get("Destination") == "/var/lib/postgresql"]
+    if len(mounts) != 1 or mounts[0].get("Type") != "volume" or mounts[0].get("Name") != expected_volume:
+        raise GateError("Refusing database operation: the db container does not use the generated project volume.")
+    volume = json.loads(run(["docker", "volume", "inspect", expected_volume], capture=True).stdout)[0]
+    if volume.get("Labels", {}).get("com.docker.compose.project") != project:
+        raise GateError("Refusing database operation: the database volume is not owned by this disposable project.")
+
+
+def pg_dump_to_file(compose: list[str], env: dict[str, str], destination: Path) -> None:
+    command = compose + ["exec", "-T", "db", "pg_dump", "--format=custom", "--no-owner", "--no-acl", "--username=financegame", "--dbname=financegame"]
+    temporary = destination.with_suffix(destination.suffix + ".partial")
+    with temporary.open("wb") as output:
+        result = subprocess.run(command, stdout=output, stderr=subprocess.PIPE, env=env)
+    if result.returncode:
+        temporary.unlink(missing_ok=True)
+        raise GateError(f"Database backup command failed ({result.returncode}): {(result.stderr or b'').decode(errors='replace')[-4000:]}")
+    if not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        raise GateError("Database backup command produced an empty archive.")
+    temporary.replace(destination)
+
+
+def pg_restore_file(compose: list[str], env: dict[str, str], source: Path) -> None:
+    command = compose + ["exec", "-T", "db", "pg_restore", "--exit-on-error", "--single-transaction", "--no-owner", "--no-acl", "--username=financegame", "--dbname=financegame"]
+    with source.open("rb") as archive:
+        result = subprocess.run(command, stdin=archive, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    if result.returncode:
+        output = (result.stdout or b"").decode(errors="replace")
+        raise GateError(f"Database restore command failed ({result.returncode}): {output[-6000:]}")
+
+
+def database_schema_version(compose: list[str], env: dict[str, str]) -> int:
+    value = run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-Atc", "SELECT COALESCE(MAX(version),0) FROM schema_migrations"], capture=True, env=env).stdout.strip()
+    try:
+        return int(value)
+    except ValueError as error:
+        raise GateError(f"Database schema version query returned invalid value {value!r}.") from error
+
+
+def cleanup_project(compose: list[str], env: dict[str, str], project: str, evidence: Path, label: str = "primary") -> None:
     containers = run(compose + ["ps", "-aq"], env=env, capture=True).stdout.strip().split()
     resources = [("container", item, ["docker", "inspect", "-f", "{{ index .Config.Labels \"com.docker.compose.project\" }}", item]) for item in containers]
     volumes = run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip().split()
@@ -273,13 +355,13 @@ def cleanup_project(compose: list[str], env: dict[str, str], project: str, evide
             if inspected.stdout.strip() != project:
                 raise GateError(f"Refusing cleanup: image {item} has unexpected capability project label {inspected.stdout.strip()!r}.")
     for kind, item, inspect in resources:
-        label = run(inspect, capture=True).stdout.strip()
-        if label != project:
-            raise GateError(f"Refusing cleanup: {kind} {item} has unexpected Compose project label {label!r}.")
+        resource_project = run(inspect, capture=True).stdout.strip()
+        if resource_project != project:
+            raise GateError(f"Refusing cleanup: {kind} {item} has unexpected Compose project label {resource_project!r}.")
     result = run(compose + ["down", "--volumes", "--remove-orphans"], check=False, env=env, capture=True)
-    (evidence / "cleanup.log").write_text(result.stdout or "")
+    (evidence / f"cleanup-{label}.log").write_text(result.stdout or "")
     if result.returncode:
-        raise GateError(f"Compose cleanup failed ({result.returncode}); see {evidence / 'cleanup.log'}.")
+        raise GateError(f"Compose cleanup failed ({result.returncode}); see {evidence / f'cleanup-{label}.log'}.")
     for item in present_images:
         run(["docker", "image", "rm", item], capture=True)
     leftovers = {
@@ -373,10 +455,92 @@ def write_override(temp: Path, issuer: str, project: str, pair_sha: str = "test-
     return path
 
 
-def compose_command(temp: Path, override: Path, project: str) -> list[str]:
+def write_recovery_override(temp: Path, images: dict[str, str]) -> Path:
+    override = {"services": {}}
+    for service in ("db", "migrate", "api", "ui"):
+        override["services"][service] = {"image": images[service], "pull_policy": "never"}
+    # A template0 database lets pg_restore recreate the dumped public schema cleanly.
+    override["services"]["db"]["environment"] = {"POSTGRES_DB": "postgres"}
+    path = temp / "compose.recovery.yaml"
+    path.write_text(json.dumps(override, indent=2) + "\n")
+    return path
+
+
+def tag_recovery_images(images: dict[str, str], project: str) -> tuple[dict[str, str], list[str]]:
+    references: dict[str, str] = {}
+    created: list[str] = []
+    try:
+        for service, image_id in images.items():
+            reference = f"financegame-recovery:{project}-{service}"
+            existing = run(["docker", "image", "inspect", reference], check=False, capture=True)
+            if existing.returncode == 0:
+                raise GateError(f"Generated recovery image tag already exists: {reference}")
+            run(["docker", "image", "tag", image_id, reference], capture=True)
+            created.append(reference)
+            tagged = json.loads(run(["docker", "image", "inspect", reference], capture=True).stdout)[0]
+            if tagged.get("Id") != image_id:
+                raise GateError(f"Recovery image tag {reference} does not resolve to captured image {image_id}.")
+            references[service] = reference
+    except Exception:
+        remove_recovery_image_tags(created)
+        raise
+    return references, created
+
+
+def remove_recovery_image_tags(tags: list[str]) -> None:
+    for reference in tags:
+        if not reference.startswith("financegame-recovery:fgcap-"):
+            raise GateError(f"Refusing to remove non-generated image reference {reference!r}.")
+        existing = run(["docker", "image", "inspect", reference], check=False, capture=True)
+        if existing.returncode == 0:
+            run(["docker", "image", "rm", reference], capture=True)
+
+
+def compose_command(temp: Path, override: Path, project: str, recovery_override: Path | None = None) -> list[str]:
     empty_env = temp / "empty.env"
     empty_env.write_text("# Isolated capability run; no repository .env is loaded.\n")
-    return ["docker", "compose", "--env-file", str(empty_env), "--project-directory", str(ROOT), "-p", project, "-f", str(ROOT / "compose.yaml"), "-f", str(override)]
+    command = ["docker", "compose", "--env-file", str(empty_env), "--project-directory", str(ROOT), "-p", project, "-f", str(ROOT / "compose.yaml"), "-f", str(override)]
+    if recovery_override:
+        command.extend(["-f", str(recovery_override)])
+    return command
+
+
+def project_resources_are_empty(compose: list[str], env: dict[str, str], project: str) -> None:
+    existing = run(compose + ["ps", "-aq"], check=False, env=env, capture=True).stdout.strip()
+    if existing:
+        raise GateError(f"Generated project name unexpectedly already owns containers: {project}")
+    for service in ("db", "migrate", "api", "ui", "oidc-fixture"):
+        name = f"{project}-{service}-1"
+        collision = run(["docker", "container", "inspect", name], check=False, capture=True)
+        if collision.returncode == 0:
+            raise GateError(f"Generated container name already exists without this project's labels: {name}")
+    volumes = run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip()
+    if volumes:
+        raise GateError(f"Generated project name unexpectedly already owns volumes: {project}")
+    volume_collision = run(["docker", "volume", "inspect", f"{project}_postgres_data"], check=False, capture=True)
+    if volume_collision.returncode == 0:
+        raise GateError(f"Generated database volume name already exists without this project's labels: {project}_postgres_data")
+    networks = run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip()
+    if networks:
+        raise GateError(f"Generated project name unexpectedly already owns networks: {project}")
+    network_collision = run(["docker", "network", "inspect", f"{project}_backend"], check=False, capture=True)
+    if network_collision.returncode == 0:
+        raise GateError(f"Generated network name already exists without this project's labels: {project}_backend")
+
+
+def postgres_image_version(compose: list[str], env: dict[str, str]) -> str:
+    return run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "postgres", "-Atc", "SHOW server_version"], capture=True, env=env).stdout.strip()
+
+
+def migration_versions(compose: list[str], env: dict[str, str]) -> list[int]:
+    output = run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-Atc", "SELECT COALESCE(json_agg(version ORDER BY version), '[]'::json)::text FROM schema_migrations"], capture=True, env=env).stdout.strip()
+    try:
+        values = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise GateError(f"Database migration list returned invalid JSON {output!r}.") from error
+    if not isinstance(values, list) or any(not isinstance(item, int) for item in values):
+        raise GateError(f"Database migration list has an invalid shape: {values!r}.")
+    return values
 
 
 def main() -> int:
@@ -386,6 +550,8 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="retain the project and evidence for inspection")
     parser.add_argument("--evidence-dir", type=Path, help="directory for manifest, logs and checks")
     parser.add_argument("--no-cache", action="store_true", help="build all source images without Docker cache")
+    parser.add_argument("--recovery-rehearsal", action="store_true", help="back up the fabricated database, rehearse an incompatible-schema failure, and restore into a second isolated project")
+    parser.add_argument("--precommit-validation", action="store_true", help="validate a dirty candidate worktree without issuing runtime qualification")
     args = parser.parse_args()
 
     go_path, go_info = source_info(args.go_source, "Go")
@@ -404,9 +570,11 @@ def main() -> int:
     if rule_pack != RULE_PACK:
         raise GateError(f"Capability gate requires the fixed test-only rule pack {RULE_PACK!r}; release pair selects {rule_pack!r}.")
     bundle_revision = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture=True).stdout.strip()
-    bundle_dirty = run(["git", "-C", str(ROOT), "status", "--porcelain"], capture=True).stdout.strip()
-    if bundle_dirty:
-        raise GateError("Bundle checkout is dirty; commit the release controller and gate before writing qualification evidence.")
+    bundle_dirty, bundle_tree_sha = bundle_worktree_fingerprint()
+    if bundle_dirty and not args.precommit_validation:
+        raise GateError("Bundle checkout is dirty; use --precommit-validation for runtime evidence without qualification, or run a clean checkout.")
+    if args.precommit_validation and not bundle_dirty:
+        raise GateError("--precommit-validation requires a dirty candidate bundle checkout.")
     if not shutil.which("docker") or not shutil.which("openssl"):
         raise GateError("Docker Compose and openssl are required.")
     daemon = run(["docker", "info"], check=False, capture=True)
@@ -428,6 +596,8 @@ def main() -> int:
     build_sources = temp / "build-sources"
     build_sources.mkdir()
     evidence = args.evidence_dir.resolve() if args.evidence_dir else ROOT / "outputs" / "capability-gates" / project
+    if evidence.exists() and any(evidence.iterdir()):
+        raise GateError(f"Evidence directory must be empty so old qualification receipts cannot survive a failed run: {evidence}")
     evidence.mkdir(parents=True, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith("COMPOSE_")}
     try:
@@ -439,6 +609,13 @@ def main() -> int:
     env.update({"GO_SOURCE": str(go_build_source), "UI_SOURCE": str(ui_build_source), "UI_PORT": str(port), "BIND_ADDRESS": "127.0.0.1", "POSTGRES_PASSWORD": secrets.token_urlsafe(32), "CAPABILITY_TEMP_ROOT": str(temp), "CAPABILITY_PROJECT": project,
                 "RELEASE_ID": pair["releaseId"], "RELEASE_PAIR_SHA256": pair_sha, "RELEASE_QUALIFICATION": pair["qualification"]["status"],
                 "GO_SOURCE_REVISION": go_info["revision"], "UI_SOURCE_REVISION": ui_info["revision"]})
+    recovery_project = "fgcap-" + uuid.uuid4().hex[:12] if args.recovery_rehearsal else ""
+    recovery_port = free_port() if args.recovery_rehearsal else 0
+    while args.recovery_rehearsal and recovery_port == port:
+        recovery_port = free_port()
+    recovery_env = dict(env)
+    if args.recovery_rehearsal:
+        recovery_env.update({"CAPABILITY_PROJECT": recovery_project, "UI_PORT": str(recovery_port), "POSTGRES_PASSWORD": secrets.token_urlsafe(32)})
     try:
         run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(temp / "tls.key"), "-out", str(temp / "tls.crt"), "-subj", "/CN=oidc", "-addext", "subjectAltName=DNS:oidc", "-days", "1"], capture=True)
         (temp / "tls.crt").chmod(0o644)
@@ -460,25 +637,27 @@ def main() -> int:
     manifest: dict[str, object] = {"project": project, "uiPort": port, "goSource": go_info, "uiSource": ui_info,
                                    "releaseId": pair["releaseId"], "releasePairSha256": pair_sha,
                                    "qualificationStatus": pair["qualification"]["status"], "compatibility": compatibility,
-                                   "rulePackVersion": rule_pack, "fixtureOnly": True, "evidenceDirectory": str(evidence), "phases": []}
-    created = False
-    cleanup_attempted = False
-    project_cleaned = False
+                                   "bundleRevision": bundle_revision, "bundleWorktreeSha256": bundle_tree_sha,
+                                   "validationMode": "precommit" if args.precommit_validation else "clean-checkout",
+                                   "rulePackVersion": rule_pack, "fixtureOnly": True, "recoveryRehearsal": args.recovery_rehearsal,
+                                   "evidenceDirectory": str(evidence), "phases": []}
+    created_projects: list[tuple[list[str], dict[str, str], str, str]] = []
+    recovery_image_tags: list[str] = []
+    projects_cleaned = False
     temp_cleaned = False
-    logs: list[str] = []
 
     def phase(name: str, status: str, **details: object) -> None:
         manifest["phases"].append({"name": name, "status": status, **details})
         (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     def collect_logs() -> None:
-        result = run(compose + ["logs", "--no-color", "--tail", "500"], check=False, env=env, capture=True)
-        logs.append(result.stdout or "")
-        (evidence / "compose.log").write_text("\n".join(logs)[-200_000:])
+        for project_compose, project_env, _, label in created_projects:
+            result = run(project_compose + ["logs", "--no-color", "--tail", "500"], check=False, env=project_env, capture=True)
+            (evidence / f"compose-{label}.log").write_text((result.stdout or "")[-100_000:])
 
     try:
         def interrupt(signum: int, _frame: object) -> None:
-            raise GateError(f"interrupted by signal {signum}; removing only project {project}")
+            raise GateError(f"interrupted by signal {signum}; removing only projects created by this run")
 
         signal.signal(signal.SIGINT, interrupt)
         signal.signal(signal.SIGTERM, interrupt)
@@ -502,12 +681,13 @@ def main() -> int:
         collisions = sorted(set(capability_images(project)) & existing_images)
         if collisions:
             raise GateError(f"Generated project name unexpectedly already owns capability images: {collisions}")
-        created = True
+        created_projects.append((compose, env, project, "primary"))
         if args.no_cache:
             run(compose + ["build", "--no-cache", "migrate", "api", "ui"], env=env, capture=True)
             phase("fresh-build", "passed", noCache=True, goRevision=go_info["revision"], uiRevision=ui_info["revision"])
         build_flag = ["--no-build"] if args.no_cache else ["--build"]
         run(compose + ["up", *build_flag, "--detach", "--wait", "db"], env=env)
+        verify_disposable_database(compose, env)
         # Deliberately wrong credentials prove failed migration is visible and recoverable.
         failed = run(compose + ["run", "--rm", "--no-deps", "-e", "PGPASSWORD=capability-intentionally-wrong", "migrate"], check=False, env=env, capture=True)
         (evidence / "migration-failure.log").write_text((failed.stdout or "")[-20_000:])
@@ -517,12 +697,17 @@ def main() -> int:
             raise GateError(f"Migration failure did not report the expected database credential error:\n{(failed.stdout or '')[-1200:]}")
         phase("migration-connection-failure", "passed", exitCode=failed.returncode)
 
-        if args.no_cache:
-            run(compose + ["build", "--no-cache", "migrate", "api", "ui"], env=env, capture=True)
-            phase("fresh-build", "passed", noCache=True, goRevision=go_info["revision"], uiRevision=ui_info["revision"])
         build_flag = ["--no-build"] if args.no_cache else ["--build"]
         run(compose + ["up", *build_flag, "--detach", "--wait"], env=env)
         deployed_pair = inspect_deployed_pair(compose, env, {"go": str(go_info["revision"]), "ui": str(ui_info["revision"])})
+        db_container_id = run(compose + ["ps", "-q", "db"], env=env, capture=True).stdout.strip()
+        db_inspected = json.loads(run(["docker", "inspect", db_container_id], capture=True).stdout)[0]
+        db_labels = db_inspected.get("Config", {}).get("Labels", {}) or {}
+        if db_labels.get("com.docker.compose.project") != project or db_labels.get("com.docker.compose.service") != "db":
+            raise GateError("The database container does not belong to this generated disposable project.")
+        deployed_pair["db"] = {"containerId": db_container_id, "imageId": db_inspected.get("Image"), "postgresVersion": postgres_image_version(compose, env)}
+        if not deployed_pair["db"]["imageId"]:
+            raise GateError("Could not record the immutable Postgres image ID.")
         manifest["deployedImages"] = deployed_pair
         phase("deployed-source-pair", "passed", images=deployed_pair)
         base = f"http://127.0.0.1:{port}"
@@ -585,7 +770,8 @@ def main() -> int:
             raise GateError(f"Missing pack response should be actionable rule_pack_not_found, received: {missing_pack}")
         run_response = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs/{compilation_version}/runs", token, body={}, expected=201)
         run_id = run_response.get("id", run_response.get("run", {}).get("id"))
-        if run_response.get("status") != "completed":
+        run_hash = run_response.get("resultHash")
+        if run_response.get("status") != "completed" or not run_hash:
             raise GateError(f"The fixture Run did not complete successfully: {run_response}")
         result_hash = run_response.get("resultHash")
         if not result_hash or run_response.get("compilationHash") != compilation_hash:
@@ -673,14 +859,54 @@ def main() -> int:
         if observed_report != expected_report:
             raise GateError(f"Run report compatibility mismatch: expected {expected_report}, received {observed_report}.")
         manifest["observedCompatibility"] = {"rulePackVersion": rule_pack, **observed_compiler, **observed_run, **observed_report}
-        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "secondRunId": second_run_id, "historyGoalId": goal.get("id"), "householdRunHistoryPageIds": household_history_ids, "householdRunHistoryPageCount": household_history_page_count, "scenarioRunHistoryIds": sorted(scenario_history_ids), "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonId": comparison_id, "comparisonReopened": reopened_comparison.get("id") == comparison_id, "comparisonDeltas": deltas, "missingPackError": missing_code}
+        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "runHash": run_hash, "secondRunId": second_run_id, "historyGoalId": goal.get("id"), "householdRunHistoryPageIds": household_history_ids, "householdRunHistoryPageCount": household_history_page_count, "scenarioRunHistoryIds": sorted(scenario_history_ids), "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonId": comparison_id, "comparisonReopened": reopened_comparison.get("id") == comparison_id, "comparisonDeltas": deltas, "missingPackError": missing_code}
         phase("fabricated-household-compile-run-reopen-compare", "passed", artifacts=manifest["artifacts"])
 
-        # A future schema marker must fail closed and be recoverable by removing only that marker.
-        max_version = int(run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-Atc", "SELECT COALESCE(MAX(version),0) FROM schema_migrations"], capture=True, env=env).stdout.strip())
+        # A recovery rehearsal captures a consistent backup before introducing an incompatible schema marker.
+        max_version = database_schema_version(compose, env)
         if max_version != compatibility["databaseSchemaVersion"]:
             raise GateError(f"Database schema mismatch: expected migration {compatibility['databaseSchemaVersion']}, observed {max_version}.")
+        schema_migrations = migration_versions(compose, env)
+        if args.recovery_rehearsal:
+            verify_disposable_database(compose, env)
+            run(compose + ["stop", "api"], env=env, capture=True)
+            backup_path = evidence / "fabricated-database.dump"
+            pg_dump_to_file(compose, env, backup_path)
+            backup_record = {
+                "format": "PostgreSQL custom archive",
+                "location": backup_path.resolve().as_uri(),
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+                "sha256": hashlib.sha256(backup_path.read_bytes()).hexdigest(),
+                "sizeBytes": backup_path.stat().st_size,
+                "releaseId": pair["releaseId"],
+                "releasePairSha256": pair_sha,
+                "sources": {"go": {"revision": go_info["revision"]}, "ui": {"revision": ui_info["revision"]}},
+                "schemaVersion": max_version,
+                "schemaMigrations": schema_migrations,
+                "postgresVersion": deployed_pair["db"]["postgresVersion"],
+                "images": {name: value["imageId"] for name, value in deployed_pair.items()},
+                "artifacts": {"householdId": household_id, "snapshotId": snapshot_id, "snapshotHash": finalized_hash,
+                              "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash,
+                              "runId": run_id, "runHash": run_hash},
+            }
+            (evidence / "backup-reference.json").write_text(json.dumps(backup_record, indent=2) + "\n")
+            release.read_backup_reference(str(evidence / "backup-reference.json"), {
+                "releaseId": pair["releaseId"], "databaseSchemaVersion": max_version,
+                "releasePairSha256": pair_sha,
+                "sources": {"go": {"revision": go_info["revision"]}, "ui": {"revision": ui_info["revision"]}},
+            })
+            manifest["backup"] = backup_record
+            phase("consistent-backup-created", "passed", backup=backup_record)
+            run(compose + ["start", "api"], env=env, capture=True)
+            readiness = run(compose + ["exec", "-T", "ui", "wget", "-q", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=env, capture=True)
+            deadline = time.monotonic() + TIMEOUT
+            while readiness.returncode and time.monotonic() < deadline:
+                time.sleep(1)
+                readiness = run(compose + ["exec", "-T", "ui", "wget", "-q", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=env, capture=True)
+            if readiness.returncode:
+                raise GateError("API did not return ready after the backup was captured.")
         sentinel = max_version + 1000
+        verify_disposable_database(compose, env)
         run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-c", f"INSERT INTO schema_migrations(version) VALUES ({sentinel})"], env=env, capture=True)
         mismatch = run(compose + ["run", "--rm", "--no-deps", "migrate"], check=False, env=env, capture=True)
         (evidence / "migration-version-failure.log").write_text((mismatch.stdout or "")[-20_000:])
@@ -689,43 +915,116 @@ def main() -> int:
         ready_probe = run(compose + ["exec", "-T", "ui", "wget", "-S", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=env, capture=True)
         if ready_probe.returncode == 0 or "503" not in (ready_probe.stdout or ""):
             raise GateError(f"API readiness did not fail for the future schema marker as expected: {(ready_probe.stdout or '')[-1200:]}")
-        # Delete exactly the sentinel inserted by this invocation.
-        run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-c", f"DELETE FROM schema_migrations WHERE version = {sentinel}"], env=env, capture=True)
-        run(compose + ["run", "--rm", "--no-deps", "migrate"], env=env, capture=True)
-        phase("migration-version-failure-recovery", "passed", insertedAndRemovedVersion=sentinel)
+        if args.recovery_rehearsal:
+            phase("migration-version-incompatibility", "passed", insertedVersion=sentinel, databaseSchemaVersion=max_version)
+            images = {name: value["imageId"] for name, value in deployed_pair.items()}
+            image_references, recovery_image_tags = tag_recovery_images(images, recovery_project)
+            recovery_override = write_recovery_override(temp, image_references)
+            recovery_compose = compose_command(temp, override, recovery_project, recovery_override)
+            inspect_config(recovery_compose, recovery_env)
+            project_resources_are_empty(recovery_compose, recovery_env, recovery_project)
+            created_projects.append((recovery_compose, recovery_env, recovery_project, "recovery"))
+            manifest["recoveryProject"] = {"name": recovery_project, "uiPort": recovery_port, "restoresFrom": project}
+            run(recovery_compose + ["up", "--no-build", "--detach", "--wait", "db"], env=recovery_env, capture=True)
+            verify_disposable_database(recovery_compose, recovery_env)
+            existing_database = run(recovery_compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "postgres", "-Atc", "SELECT 1 FROM pg_database WHERE datname='financegame'"], capture=True, env=recovery_env).stdout.strip()
+            if existing_database:
+                raise GateError("Recovery database name already exists; refusing to restore into a non-fresh database.")
+            run(recovery_compose + ["exec", "-T", "db", "createdb", "--template=template0", "--owner=financegame", "--maintenance-db=postgres", "--username=financegame", "financegame"], env=recovery_env, capture=True)
+            blank_database = run(recovery_compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-Atc", "SELECT to_regclass('public.schema_migrations')"], capture=True, env=recovery_env).stdout.strip()
+            if blank_database:
+                raise GateError("New recovery database contains a schema migration table before restore.")
+            backup_path = evidence / "fabricated-database.dump"
+            backup_record = manifest.get("backup", {})
+            actual_sha = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+            if actual_sha != backup_record.get("sha256") or backup_path.stat().st_size != backup_record.get("sizeBytes"):
+                raise GateError("Database backup archive checksum or length changed before restore.")
+            pg_restore_file(recovery_compose, recovery_env, backup_path)
+            restored_schema = database_schema_version(recovery_compose, recovery_env)
+            restored_migrations = migration_versions(recovery_compose, recovery_env)
+            if restored_schema != max_version or restored_migrations != schema_migrations:
+                raise GateError(f"Restored migration state differs from the backup: expected {schema_migrations}, received {restored_migrations}.")
+            run(recovery_compose + ["run", "--rm", "--no-deps", "migrate"], env=recovery_env, capture=True)
+            run(recovery_compose + ["up", "--no-build", "--detach", "--wait"], env=recovery_env, capture=True)
+            recovery_pair = inspect_deployed_pair(recovery_compose, recovery_env, {"go": str(go_info["revision"]), "ui": str(ui_info["revision"])})
+            recovery_db_id = run(recovery_compose + ["ps", "-q", "db"], env=recovery_env, capture=True).stdout.strip()
+            recovery_db = json.loads(run(["docker", "inspect", recovery_db_id], capture=True).stdout)[0]
+            recovery_pair["db"] = {"containerId": recovery_db_id, "imageId": recovery_db.get("Image"), "postgresVersion": postgres_image_version(recovery_compose, recovery_env)}
+            for service in ("db", "migrate", "api", "ui"):
+                if recovery_pair.get(service, {}).get("imageId") != deployed_pair.get(service, {}).get("imageId"):
+                    raise GateError(f"Recovery service {service} is not using the same captured image ID as the source deployment.")
+            recovery_base = f"http://127.0.0.1:{recovery_port}"
+            wait_http(recovery_base + "/health/live")
+            wait_http(recovery_base + "/households")
+            restored_snapshot = request_json(recovery_base, f"/api/v1/households/{household_id}/snapshots/{snapshot_id}", token)
+            restored_compilation = request_json(recovery_base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs/{compilation_version}", token)
+            restored_run = request_json(recovery_base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
+            restored_snapshot_hash = restored_snapshot.get("finalized", {}).get("contentHash")
+            if restored_snapshot_hash != finalized_hash:
+                raise GateError(f"Finalized Snapshot hash changed after restore: expected {finalized_hash}, received {restored_snapshot_hash!r}.")
+            if restored_compilation.get("contentHash") != compilation_hash:
+                raise GateError("Compilation hash changed after restore.")
+            if restored_run.get("id") != run_id or restored_run.get("resultHash") != run_hash:
+                raise GateError(f"Immutable Run identity or result hash changed after restore: expected {run_id}/{run_hash}, received {restored_run.get('id')}/{restored_run.get('resultHash')}.")
+            if restored_schema != compatibility["databaseSchemaVersion"] or migration_versions(recovery_compose, recovery_env) != schema_migrations:
+                raise GateError("Restored database does not match the release's expected migration set.")
+            manifest["recoveredImages"] = recovery_pair
+            phase("backup-restored-to-matching-release", "passed", backupSha256=actual_sha, databaseSchemaVersion=restored_schema,
+                  schemaMigrations=restored_migrations, snapshotHash=restored_snapshot_hash, compilationHash=restored_compilation.get("contentHash"),
+                  runId=restored_run.get("id"), runHash=restored_run.get("resultHash"), images=recovery_pair)
+            # Keep the canonical qualification phase consumed by release_pair.load;
+            # recovery mode has now recovered from the migration-version failure
+            # by restoring the matching backup into a matching release project.
+            phase("migration-version-failure-recovery", "passed", insertedVersion=sentinel,
+                  backupSha256=actual_sha, recoveredProject=recovery_project)
+            offline_compose, offline_env, offline_base = recovery_compose, recovery_env, recovery_base
+        else:
+            # The ordinary capability gate removes only the sentinel it inserted, then retries migration.
+            verify_disposable_database(compose, env)
+            run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-c", f"DELETE FROM schema_migrations WHERE version = {sentinel}"], env=env, capture=True)
+            run(compose + ["run", "--rm", "--no-deps", "migrate"], env=env, capture=True)
+            phase("migration-version-failure-recovery", "passed", insertedAndRemovedVersion=sentinel)
+            offline_compose, offline_env, offline_base = compose, env, base
 
-        # Stop only this project's API and verify Nginx stays live with structured 503.
-        run(compose + ["stop", "api"], env=env, capture=True)
-        wait_http(base + "/health/live")
-        status, body, _ = wait_http(base + "/api/v1", expected=503, headers=headers, timeout=30)
+        # Stop only a generated project's API and verify Nginx stays live with structured 503.
+        run(offline_compose + ["stop", "api"], env=offline_env, capture=True)
+        wait_http(offline_base + "/health/live")
+        status, body, _ = wait_http(offline_base + "/api/v1", expected=503, headers=headers, timeout=30)
         unavailable = json.loads(body).get("error", {}).get("code")
         if unavailable != "api_unavailable":
             raise GateError(f"API outage was not returned as structured api_unavailable: HTTP {status} {body[:500]!r}")
-        run(compose + ["start", "api"], env=env, capture=True)
-        ready_after_recovery = run(compose + ["exec", "-T", "ui", "wget", "-q", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=env, capture=True)
+        run(offline_compose + ["start", "api"], env=offline_env, capture=True)
+        ready_after_recovery = run(offline_compose + ["exec", "-T", "ui", "wget", "-q", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=offline_env, capture=True)
         deadline = time.monotonic() + TIMEOUT
         while ready_after_recovery.returncode and time.monotonic() < deadline:
             time.sleep(1)
-            ready_after_recovery = run(compose + ["exec", "-T", "ui", "wget", "-q", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=env, capture=True)
+            ready_after_recovery = run(offline_compose + ["exec", "-T", "ui", "wget", "-q", "-O", "/dev/null", "http://api:8080/health/ready"], check=False, env=offline_env, capture=True)
         if ready_after_recovery.returncode:
             raise GateError("API readiness did not recover after removing the inserted schema marker and restarting the API.")
-        wait_http(base + "/api/v1/reference/canadian-rule-packs", headers=headers, timeout=TIMEOUT)
-        recovered_run = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
+        wait_http(offline_base + "/api/v1/reference/canadian-rule-packs", headers=headers, timeout=TIMEOUT)
+        recovered_run = request_json(offline_base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
         assert_run_artifact(recovered_run, run_id, compilation_hash, result_hash)
-        assert_fixture_report(request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token))
+        assert_fixture_report(request_json(offline_base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token))
         phase("api-offline-and-recovery", "passed", outageCode=unavailable)
         collect_logs()
         if args.keep:
-            phase("complete", "passed", cleanup="kept", fixtureDirectory=str(temp))
+            phase("complete", "passed", cleanup="kept", fixtureDirectory=str(temp), projects=[item[2] for item in created_projects])
         else:
-            cleanup_project(compose, env, project, evidence)
-            cleanup_attempted = True
-            project_cleaned = True
+            for project_compose, project_env, project_name, label in created_projects:
+                cleanup_project(project_compose, project_env, project_name, evidence, label)
+            projects_cleaned = True
+            remove_recovery_image_tags(recovery_image_tags)
             cleanup_temp_directory(temp)
             temp_cleaned = True
-            phase("complete", "passed", cleanup="removed")
+            phase("complete", "passed", cleanup="removed", projects=[item[2] for item in created_projects])
         print(f"Capability gate passed. Evidence: {evidence}")
-        if not args.keep and args.no_cache:
+        if args.precommit_validation:
+            current_status, current_tree_sha = bundle_worktree_fingerprint()
+            if current_status != bundle_dirty or current_tree_sha != bundle_tree_sha:
+                raise GateError("Bundle candidate changed during precommit validation; evidence does not match the final worktree.")
+            manifest["candidateWorktreeUnchanged"] = True
+            (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        if not args.keep and args.no_cache and not args.precommit_validation:
             receipt = {
                 "status": "runtime-qualified", "releaseId": pair["releaseId"], "releasePairSha256": pair_sha,
                 "sources": {"go": go_info["revision"], "ui": ui_info["revision"]},
@@ -745,15 +1044,23 @@ def main() -> int:
         print(f"Capability gate failed: {error}\nEvidence: {evidence}", file=sys.stderr)
         return 1
     finally:
-        if created and not args.keep and not cleanup_attempted:
-            try:
-                cleanup_project(compose, env, project, evidence)
-                project_cleaned = True
-            except Exception as error:
-                print(f"Capability gate cleanup failed: {error}", file=sys.stderr)
+        if created_projects and not args.keep and not projects_cleaned:
+            cleanup_succeeded = True
+            for project_compose, project_env, project_name, label in created_projects:
+                try:
+                    cleanup_project(project_compose, project_env, project_name, evidence, label)
+                except Exception as error:
+                    cleanup_succeeded = False
+                    print(f"Capability gate cleanup failed for {project_name}: {error}", file=sys.stderr)
+            projects_cleaned = cleanup_succeeded
+            if projects_cleaned and recovery_image_tags:
+                try:
+                    remove_recovery_image_tags(recovery_image_tags)
+                except Exception as error:
+                    print(f"Recovery image-tag cleanup failed: {error}", file=sys.stderr)
         if args.keep:
-            print(f"Kept disposable project {project} and fixture files at {temp} for inspection.")
-        elif (not created or project_cleaned) and not temp_cleaned:
+            print(f"Kept disposable projects {[item[2] for item in created_projects]} and fixture files at {temp} for inspection.")
+        elif (not created_projects or projects_cleaned) and not temp_cleaned:
             try:
                 cleanup_temp_directory(temp)
                 temp_cleaned = True

@@ -1,6 +1,5 @@
 .env
 .serena/
 .release-deployments/
-outputs/capability-gates/
-scripts/__pycache__/
-tests/__pycache__/
+/outputs/
+__pycache__/

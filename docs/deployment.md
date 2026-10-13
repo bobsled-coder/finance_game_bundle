@@ -46,7 +46,12 @@ for container health checks before returning.
 The API and database use only the private Compose network. The UI is published
 on `127.0.0.1:3000` by default. Configure `BIND_ADDRESS`, `UI_PORT`, and
 `POSTGRES_PASSWORD` in `.env` for another deployment. Use a unique database
-password before making the UI reachable from another machine.
+password before making the UI reachable from another machine. A non-loopback
+bind only changes the host listener; it does not add TLS or access control.
+For hosted use, put the UI behind a TLS-terminating ingress, configure
+authenticated access and network policy at that boundary, keep API/Postgres
+private, and provide managed secrets and off-host backups. Local Compose is a
+single-machine development deployment, not a hosted security configuration.
 
 ## Data and upgrades
 
@@ -55,8 +60,10 @@ Postgres data lives in the Compose volume `finance_game_bundle_postgres_data`.
 repository's Compose volume or transfer existing data.
 
 The API checks that the database schema matches its compiled migration version.
-Back up the database before upgrading. After a migration advances the schema, a
-rollback to an older API may require restoring the matching database backup.
+Take a consistent custom-format `pg_dump` before upgrading and keep its checksum
+and active release reference with the file. After a migration advances the
+schema, rolling back an image does not reverse SQL; restoring the matching
+database backup may be required.
 `just up` records each deployment attempt under `.release-deployments/`. A
 restart with the already recorded clean pair and schema needs no new backup.
 When the pair or schema changes, or either local override is dirty, and the
@@ -74,6 +81,166 @@ input shape. The checksum is syntax-checked; the controller does not claim to
 read or verify the backup bytes.
 See [`previous-release-reference.example.json`](previous-release-reference.example.json)
 for the one-time metadata needed to adopt an existing volume.
+
+### Create a deployment backup
+
+Run these read-only database commands before changing the UI/API pair. Keep the
+backup outside the Compose project directory and restrict its permissions:
+
+```sh
+umask 077
+backup_dir="$HOME/finance-game-backups"
+mkdir -p "$backup_dir"
+backup="$backup_dir/finance-game-$(date -u +%Y%m%dT%H%M%SZ).dump"
+docker compose exec -T db pg_dump --format=custom --no-owner --no-acl \
+  --username=financegame --dbname=financegame > "$backup"
+sha256sum "$backup"
+docker compose exec -T db psql -U financegame -d financegame -Atc \
+  'SELECT COALESCE(MAX(version),0) FROM schema_migrations'
+cat .release-deployments/active.json
+```
+
+Use the checksum, schema result, release ID, pair SHA and Go/UI revisions from
+`active.json` to fill in `backup-reference.json` from the example. Record the
+absolute backup location and UTC creation time. Preserve the original dump and
+reference together. `just up <backup-reference.json>` checks that the release
+and schema metadata match the active deployment before it starts a migration;
+the reference check does not read the dump, so verify the checksum separately.
+
+Do not restore this backup over the deployment volume as a test. Use the
+disposable recovery rehearsal below first. For an actual failed upgrade, keep
+the old volume and failed attempt record intact and restore into a separately
+named project/volume using the recorded previous release pair. The following
+example assumes the previous Go/UI SHAs and release metadata are copied from
+the preserved deployment references. It creates a new project and volume; do
+not substitute the live Compose project name.
+
+```sh
+set -eu
+export RECOVERY_PROJECT="finance-game-recovery-$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 4)"
+export GO_SOURCE='ssh://git@github.com/bobsled-coder/finance_game_go.git#<previous-go-sha>'
+export UI_SOURCE='ssh://git@github.com/bobsled-coder/finance_game_ui.git#<previous-ui-sha>'
+export GO_SOURCE_REVISION='<previous-go-sha>'
+export UI_SOURCE_REVISION='<previous-ui-sha>'
+export RELEASE_ID='<previous-release-id>'
+export RELEASE_PAIR_SHA256='<previous-release-pair-sha256>'
+export RELEASE_QUALIFICATION='<previous-qualification-status>'
+export BIND_ADDRESS=127.0.0.1
+export UI_PORT=3300
+export POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+backup='/secure-backups/finance-game-previous.dump'
+reference='/secure-backups/finance-game-previous-reference.json'
+expected_sha="$(jq -r '.sha256' "$reference")"
+
+actual_sha="$(sha256sum "$backup")"
+test "${actual_sha%% *}" = "$expected_sha"
+if docker volume inspect "${RECOVERY_PROJECT}_postgres_data" >/dev/null 2>&1; then
+  echo "Recovery volume already exists; choose a new project name." >&2
+  exit 1
+fi
+docker compose -p "$RECOVERY_PROJECT" up --detach --wait db
+test -z "$(docker compose -p "$RECOVERY_PROJECT" exec -T db psql \
+  -U financegame -d financegame -Atc \
+  "SELECT to_regclass('public.schema_migrations')")"
+docker compose -p "$RECOVERY_PROJECT" exec -T db pg_restore \
+  --exit-on-error --single-transaction --no-owner --no-acl \
+  --username=financegame --dbname=financegame < "$backup"
+docker compose -p "$RECOVERY_PROJECT" run --rm migrate
+docker compose -p "$RECOVERY_PROJECT" up -d --build
+docker compose -p "$RECOVERY_PROJECT" exec -T db psql \
+  -U financegame -d financegame -Atc \
+  'SELECT COALESCE(MAX(version),0) FROM schema_migrations'
+docker compose -p "$RECOVERY_PROJECT" exec -T db postgres --version
+docker compose -p "$RECOVERY_PROJECT" ps
+```
+
+Before opening the recovery UI at `http://127.0.0.1:3300`, inspect the
+recovery project's container labels and image IDs and compare the release ID,
+pair SHA, Go/UI SHAs, and database image with the preserved previous-release
+reference. These raw Compose commands do not write the controller's deployment
+record. Capture the values with:
+
+```sh
+for service in db migrate api ui; do
+  container="$(docker compose -p "$RECOVERY_PROJECT" ps -a -q "$service")"
+  test -n "$container"
+  docker inspect "$container" --format '{{.Image}} {{json .Config.Labels}}'
+done
+```
+
+Authenticate to the recovered API, then compare the saved finalized Snapshot
+and Run hashes directly. The backup reference carries these IDs and hashes:
+
+```sh
+export API_TOKEN='<bearer-token-for-recovered-api>'
+household_id="$(jq -r '.artifacts.householdId' "$reference")"
+snapshot_id="$(jq -r '.artifacts.snapshotId' "$reference")"
+run_id="$(jq -r '.artifacts.runId' "$reference")"
+snapshot_hash="$(jq -r '.artifacts.snapshotHash' "$reference")"
+run_hash="$(jq -r '.artifacts.runHash' "$reference")"
+curl -fsS -H "Authorization: Bearer $API_TOKEN" \
+  "http://127.0.0.1:3300/api/v1/households/$household_id/snapshots/$snapshot_id" \
+  | jq -e --arg expected "$snapshot_hash" '.finalized.contentHash == $expected'
+curl -fsS -H "Authorization: Bearer $API_TOKEN" \
+  "http://127.0.0.1:3300/api/v1/households/$household_id/scenarios/$(jq -r '.artifacts.scenarioId' "$reference")/runs/$run_id" \
+  | jq -e --arg expected "$run_hash" '.resultHash == $expected'
+```
+
+Record the recovery project name, image IDs, schema result, and comparison in
+the incident record. Keep the original volume and backup until the recovery has
+been reviewed; plan cutover separately. An image rollback alone is not
+database recovery.
+
+### Rehearse backup and restore
+
+The explicit recovery command creates a fabricated household in a fresh
+project, stops its API for a consistent `pg_dump`, and records the dump's
+SHA-256, release ID, source SHAs, API/migration/UI image IDs, Postgres image and
+server version, schema migration set, and Snapshot/compilation/Run IDs and
+hashes. It adds a future schema marker to the source project's disposable
+database and confirms that the matching migration image refuses that schema.
+It then starts a second generated Compose project with a new volume and the
+captured image IDs, restores the archive into an empty database, runs the
+matching migration, and checks the finalized Snapshot, compilation, and Run
+hashes through the restored API. The incompatible source project is kept until
+the evidence is collected.
+
+Run the normal qualification rehearsal with clean local checkouts matching the
+two SHAs in `release-pair.json`:
+
+```sh
+just recovery-rehearsal /work/finance_game_go /work/finance_game_ui
+```
+
+Before committing changes to the bundle gate or recovery controller, use the
+precommit form against the same clean Go/UI pair:
+
+```sh
+just recovery-rehearsal-precommit /work/finance_game_go /work/finance_game_ui
+```
+
+Precommit validation records the bundle `HEAD` and a SHA-256 fingerprint of
+tracked changes and untracked candidate files, then confirms that fingerprint
+is unchanged at the end. Its manifest is labeled `precommit` and it never emits
+a runtime qualification receipt. Run the normal clean-checkout rehearsal after
+the reviewed change is integrated to create qualification evidence.
+
+Evidence is written under
+`outputs/capability-gates/<generated-project>/`, including
+`fabricated-database.dump`, `backup-reference.json`, the phase manifest,
+failure logs, and cleanup logs. The runner rejects non-generated project names,
+external or non-project-scoped volumes/networks, unexpected bind mounts,
+published API/database ports, and existing generated resource names. Database
+backup/restore commands run only through the two generated projects. Cleanup
+checks each container, volume, and network project label before removing it;
+it never targets `finance_game_bundle_postgres_data`. `--keep` is available on
+the Python runner for diagnosis and retains both projects and fixture files.
+
+This rehearsal covers a rejected future-schema marker and logical restore of
+fabricated data into a fresh volume. It does not claim to recover every
+partially applied migration, change PostgreSQL major versions, restore external
+identity-provider state, or perform production cutover. Run the rehearsal on a
+Docker-capable host before treating recovery as verified.
 
 ## Disposable capability gate
 
@@ -102,16 +269,18 @@ volume.
 The fixture creates a fabricated Person, Household, Chequing Account, exact
 `100000.10` CAD balance, finalized 2026 Snapshot, Scenario, compilation, Run,
 and unchanged comparison through the UI's published port and `/api/v1` proxy.
-It checks SPA and deep-link fallback, selects
-`canadian-planning-rules-v1` explicitly, and verifies a made-up missing pack
+It checks SPA and deep-link fallback, selects the test-only
+`canadian-planning-rules-test-v1` pack explicitly, and verifies a made-up missing pack
 returns `rule_pack_not_found`. The shipped API does not load separately named
-fabricated statutory packs. The test therefore uses fabricated household data
-with the reviewed 2026 pack and never presents fabricated fiscal facts as law.
+fabricated statutory packs. The gate's `canadian-planning-rules-test-v1` is an
+explicit test-only compatibility target used with fabricated household data;
+it does not represent a production rule pack or fiscal facts as law.
 
 The runner starts a temporary HTTPS OIDC/JWKS fixture with a generated signing
 key, configured only in the API service override. It also rehearses a migration
 connection failure, a future schema-version incompatibility marker, recovery
 from that marker, and API-offline recovery. The schema rehearsal inserts and
 deletes only its unique sentinel row in the disposable database. These checks
-exercise service failure handling; they are not a production backup/restore or
-SQL rollback test.
+exercise service failure handling. The separate `just recovery-rehearsal`
+command additionally creates and restores a logical backup using a second
+project-scoped volume.

@@ -34,7 +34,9 @@ just down
 `just down` retains the named Postgres volume. The database is private to the
 Compose network, and the UI binds to local loopback by default. Review
 [`docs/deployment.md`](docs/deployment.md) before exposing the app or upgrading
-the API schema.
+the API schema. Before changing the release pair, take a consistent database
+backup and run the disposable recovery rehearsal with `just recovery-rehearsal`
+to verify restore compatibility and immutable artifact hashes.
 
 Work for this bundle is tracked in the
 [finance_game_bundle Linear project](https://linear.app/boblsed-coder/project/finance-game-bundle-58e2acfeb4fa).

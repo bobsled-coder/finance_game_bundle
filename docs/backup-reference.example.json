@@ -3,5 +3,32 @@
   "schemaVersion": 26,
   "location": "file:///secure-backups/finance-game-2026-10-previous.dump",
   "createdAt": "2026-10-13T12:00:00Z",
-  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "releasePairSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "sources": {
+    "go": {
+      "revision": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "ui": {
+      "revision": "89abcdef0123456789abcdef0123456789abcdef"
+    }
+  },
+  "postgresVersion": "18.6",
+  "schemaMigrations": [1, 2, 3],
+  "images": {
+    "db": "sha256:<postgres-image-id>",
+    "migrate": "sha256:<migration-image-id>",
+    "api": "sha256:<api-image-id>",
+    "ui": "sha256:<ui-image-id>"
+  },
+  "artifacts": {
+    "householdId": "<household-id>",
+    "snapshotId": "<finalized-snapshot-id>",
+    "snapshotHash": "<finalized-snapshot-content-hash>",
+    "scenarioId": "<scenario-id>",
+    "compilationVersion": "<compilation-version>",
+    "compilationHash": "<compilation-content-hash>",
+    "runId": "<run-id>",
+    "runHash": "<run-result-hash>"
+  }
 }

@@ -36,3 +36,11 @@ capability-gate go_source ui_source:
 
 test-capability-gate:
     python3 -m unittest discover -s tests -v
+
+# Back up a fabricated database, rehearse schema incompatibility, and restore it into a second isolated project.
+# Destructive restore commands are scoped to generated project-prefixed volumes only.
+recovery-rehearsal go_source ui_source:
+    python3 scripts/capability_gate.py --go-source "{{go_source}}" --ui-source "{{ui_source}}" --no-cache --recovery-rehearsal
+
+recovery-rehearsal-precommit go_source ui_source:
+    python3 scripts/capability_gate.py --go-source "{{go_source}}" --ui-source "{{ui_source}}" --no-cache --recovery-rehearsal --precommit-validation
