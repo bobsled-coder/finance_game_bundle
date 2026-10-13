@@ -226,16 +226,22 @@ def write_override(temp: Path, issuer: str) -> Path:
                     "SSL_CERT_FILE": "/capability-ca.crt",
                 },
                 "volumes": [f"{temp / 'fixture' / 'tls.crt'}:/capability-ca.crt:ro"],
-                "depends_on": {"oidc-fixture": {"condition": "service_started"}},
+                "depends_on": {"oidc-fixture": {"condition": "service_healthy"}},
             },
             "oidc-fixture": {
                 "image": "python:3.13.7-alpine3.22",
                 "command": ["python3", "/fixture/capability_oidc.py"],
                 "volumes": [f"{temp / 'fixture'}:/fixture:ro"],
                 "networks": {"backend": {"aliases": ["oidc"]}},
+                "healthcheck": {
+                    "test": ["CMD", "python3", "-c", "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/.well-known/jwks.json',context=ssl._create_unverified_context(),timeout=2).read()"],
+                    "interval": "1s",
+                    "timeout": "3s",
+                    "retries": 15,
+                    "start_period": "2s",
+                },
                 "restart": "no",
             },
-            "ui": {"depends_on": {"oidc-fixture": {"condition": "service_started"}}},
         }
     }
     path = temp / "compose.capability.yaml"
@@ -268,24 +274,29 @@ def main() -> int:
     evidence.mkdir(parents=True, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith("COMPOSE_")}
     env.update({"GO_SOURCE": str(go_path), "UI_SOURCE": str(ui_path), "UI_PORT": str(port), "BIND_ADDRESS": "127.0.0.1", "POSTGRES_PASSWORD": secrets.token_urlsafe(32), "CAPABILITY_TEMP_ROOT": str(temp), "CAPABILITY_PROJECT": project})
-    (temp / "tls.key").unlink(missing_ok=True)
-    run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(temp / "tls.key"), "-out", str(temp / "tls.crt"), "-subj", "/CN=oidc", "-addext", "subjectAltName=DNS:oidc", "-days", "1"], capture=True)
-    (temp / "tls.crt").chmod(0o644)
-    run(["openssl", "genrsa", "-out", str(temp / "signing.key"), "2048"], capture=True)
-    run(["openssl", "rsa", "-in", str(temp / "signing.key"), "-pubout", "-outform", "DER", "-out", str(temp / "signing.pub.der")], capture=True)
-    fixture_dir = temp / "fixture"
-    fixture_dir.mkdir(mode=0o755)
-    shutil.copy2(temp / "tls.crt", fixture_dir / "tls.crt")
-    shutil.copy2(temp / "tls.key", fixture_dir / "tls.key")
-    (fixture_dir / "tls.key").chmod(0o600)
-    shutil.copy2(ROOT / "scripts" / "capability_oidc.py", fixture_dir / "capability_oidc.py")
-    (fixture_dir / "jwks.json").write_text(json.dumps({"keys": [rsa_jwk((temp / "signing.pub.der").read_bytes())]}, separators=(",", ":")))
-    issuer = "https://oidc:8443/"
-    override = write_override(temp, issuer)
-    compose = compose_command(temp, override, project)
+    try:
+        run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(temp / "tls.key"), "-out", str(temp / "tls.crt"), "-subj", "/CN=oidc", "-addext", "subjectAltName=DNS:oidc", "-days", "1"], capture=True)
+        (temp / "tls.crt").chmod(0o644)
+        run(["openssl", "genrsa", "-out", str(temp / "signing.key"), "2048"], capture=True)
+        run(["openssl", "rsa", "-in", str(temp / "signing.key"), "-pubout", "-outform", "DER", "-out", str(temp / "signing.pub.der")], capture=True)
+        fixture_dir = temp / "fixture"
+        fixture_dir.mkdir(mode=0o755)
+        shutil.copy2(temp / "tls.crt", fixture_dir / "tls.crt")
+        shutil.copy2(temp / "tls.key", fixture_dir / "tls.key")
+        (fixture_dir / "tls.key").chmod(0o600)
+        shutil.copy2(ROOT / "scripts" / "capability_oidc.py", fixture_dir / "capability_oidc.py")
+        (fixture_dir / "jwks.json").write_text(json.dumps({"keys": [rsa_jwk((temp / "signing.pub.der").read_bytes())]}, separators=(",", ":")))
+        issuer = "https://oidc:8443/"
+        override = write_override(temp, issuer)
+        compose = compose_command(temp, override, project)
+    except BaseException:
+        cleanup_temp_directory(temp)
+        raise
     manifest: dict[str, object] = {"project": project, "uiPort": port, "goSource": go_info, "uiSource": ui_info, "rulePackVersion": RULE_PACK, "fixtureOnly": True, "evidenceDirectory": str(evidence), "phases": []}
     created = False
     cleanup_attempted = False
+    project_cleaned = False
+    temp_cleaned = False
     logs: list[str] = []
 
     def phase(name: str, status: str, **details: object) -> None:
@@ -447,6 +458,9 @@ def main() -> int:
         else:
             cleanup_project(compose, env, project, evidence)
             cleanup_attempted = True
+            project_cleaned = True
+            cleanup_temp_directory(temp)
+            temp_cleaned = True
             phase("complete", "passed", cleanup="removed")
         print(f"Capability gate passed. Evidence: {evidence}")
         return 0
@@ -459,15 +473,19 @@ def main() -> int:
         if created and not args.keep and not cleanup_attempted:
             try:
                 cleanup_project(compose, env, project, evidence)
+                project_cleaned = True
             except Exception as error:
                 print(f"Capability gate cleanup failed: {error}", file=sys.stderr)
         if args.keep:
             print(f"Kept disposable project {project} and fixture files at {temp} for inspection.")
-        else:
+        elif not created or project_cleaned:
             try:
                 cleanup_temp_directory(temp)
+                temp_cleaned = True
             except Exception as error:
                 print(f"Capability fixture file cleanup failed: {error}", file=sys.stderr)
+        elif not temp_cleaned:
+            print(f"Retaining fixture files at {temp} because project cleanup did not complete.", file=sys.stderr)
 
 
 if __name__ == "__main__":
