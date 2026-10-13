@@ -1,13 +1,37 @@
 # Deployment
 
-`compose.yaml` builds from the `main` branches of:
+`compose.yaml` builds from the immutable source pair recorded in
+[`release-pair.json`](../release-pair.json):
 
-- `git@github.com:bobsled-coder/finance_game_ui.git`
-- `git@github.com:bobsled-coder/finance_game_go.git`
+- `finance_game_go` at `aa83b1a2b5e3a05626653e81c6dc737a9cdbae07`
+- `finance_game_ui` at `f708b951cb429525c2f80a4db73042ae71a9e53f`
 
-Docker BuildKit fetches these Git contexts during `just up`. The machine running
-Compose needs Docker Compose, `just`, and SSH access to both repositories. Set
-`GO_SOURCE` and `UI_SOURCE` in `.env` to local checkout paths when preferred.
+Docker BuildKit fetches the full Git SHA contexts during `just up`. The machine
+running Compose needs Docker Compose, `just`, and SSH access to both
+repositories. `just release-check` resolves Compose without starting services
+and reports the source and compatibility identity.
+
+This pair is a **candidate**, not a runtime-qualified release. The disposable
+capability gate has not completed successfully for this exact pair. Its
+compatibility record names database schema 26, the selected rule pack, and the
+exact compiled-input, timeline, report, readiness, and Run artifact versions
+expected from the fabricated journey. A successful gate writes a
+`qualification.json` receipt containing the pair hash, observed versions,
+source revisions, bundle revision, image IDs, and completed phases. Only a
+receipt that binds this exact pair may be referenced when the manifest's
+`qualification.status` is changed to `qualified`.
+
+Startup reports both source revisions, qualification state, database schema,
+rule pack, and compiler contract before migration starts. API and migration
+share one Go build context and carry matching source labels; the UI has its own
+source label. The deployment record saves container and image IDs. A mismatch
+stops startup with expected and observed revisions in the diagnostic.
+
+Set `GO_SOURCE` and `UI_SOURCE` in `.env` to local checkout paths when preferred.
+Use `just up` with these overrides: it records each checkout's actual SHA and
+dirty state, labels the deployment `local-override`, and does not identify it
+as the pinned release. The capability gate accepts only clean checkouts whose
+full SHAs match the manifest.
 
 ## Startup order
 
@@ -30,12 +54,30 @@ repository's Compose volume or transfer existing data.
 The API checks that the database schema matches its compiled migration version.
 Back up the database before upgrading. After a migration advances the schema, a
 rollback to an older API may require restoring the matching database backup.
+`just up` records each deployment attempt under `.release-deployments/`. A
+restart with the already recorded pair needs no new backup. When the pair or
+compatibility contract changes and the project volume exists, supply a JSON
+backup reference with `just up path/to/backup-reference.json`; it must name the
+prior release, database schema, backup location and creation time, and a
+SHA-256 checksum. If this is a pre-controller volume without an active
+deployment record, also pass a previous-release reference as the second
+argument. The prior deployment and backup references are written before Compose
+can start the migration job. First installs are marked explicitly and require
+no prior release or backup reference. This records upgrade context; it does not
+perform a restore rehearsal, which remains a separate recovery gate.
+See [`backup-reference.example.json`](backup-reference.example.json) for the
+input shape. The checksum is syntax-checked; the controller does not claim to
+read or verify the backup bytes.
+See [`previous-release-reference.example.json`](previous-release-reference.example.json)
+for the one-time metadata needed to adopt an existing volume.
 
 ## Disposable capability gate
 
-`just capability-gate <go-source> <ui-source>` builds and exercises one isolated
-Compose project against explicit local Git checkouts. Both checkouts must be
-clean; the gate records their commit IDs and rejects dirty trees. For example:
+`just capability-gate <go-source> <ui-source>` builds without Docker cache and
+exercises one isolated Compose project against the exact Git checkouts in
+`release-pair.json`. Both checkouts must be clean and match their full recorded
+SHA; the gate records their commit IDs and rejects mismatched or dirty trees.
+For example:
 
 ```sh
 just capability-gate /work/finance_game_go /work/finance_game_ui

@@ -1,0 +1,13 @@
+{
+  "releaseId": "finance-game-2026-10-previous-release",
+  "releasePairSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "databaseSchemaVersion": 26,
+  "sources": {
+    "go": {
+      "revision": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "ui": {
+      "revision": "89abcdef0123456789abcdef0123456789abcdef"
+    }
+  }
+}

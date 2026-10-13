@@ -20,14 +20,21 @@ import urllib.error
 import urllib.request
 import uuid
 
+import release_pair
 
 ROOT = Path(__file__).resolve().parents[1]
-RULE_PACK = "canadian-planning-rules-v1"
 TIMEOUT = 90
 
 
 class GateError(RuntimeError):
     pass
+
+
+def load_release_pair() -> tuple[dict, str]:
+    try:
+        return release_pair.load()
+    except release_pair.ReleasePairError as error:
+        raise GateError(str(error)) from error
 
 
 def b64url(value: bytes) -> str:
@@ -171,9 +178,40 @@ def inspect_config(compose: list[str], env: dict[str, str]) -> None:
                 raise GateError(f"Refusing unexpected host bind mount in {service_name}: {mount.get('source')} -> {mount.get('target')}")
         if service_name in ("db", "api") and service.get("ports"):
             raise GateError(f"{service_name} must remain private; resolved Compose config publishes a port.")
+    api_context = config["services"]["api"].get("build", {}).get("context")
+    migrate_context = config["services"]["migrate"].get("build", {}).get("context")
+    if api_context != migrate_context:
+        raise GateError("API and migration services must use the same resolved Go source context.")
+    for service, revision_key in (("api", "GO_SOURCE_REVISION"), ("migrate", "GO_SOURCE_REVISION"), ("ui", "UI_SOURCE_REVISION")):
+        labels = config["services"][service].get("labels", {})
+        if labels.get("org.financegame.source.revision") != env[revision_key]:
+            raise GateError(f"Resolved {service} source revision label does not match the selected source pair.")
     ui_ports = config["services"]["ui"].get("ports", [])
     if len(ui_ports) != 1 or ui_ports[0].get("host_ip") != "127.0.0.1":
         raise GateError("The only published port must bind the UI to loopback.")
+
+
+def inspect_deployed_pair(compose: list[str], env: dict[str, str], expected: dict[str, str]) -> dict[str, dict[str, object]]:
+    deployed: dict[str, dict[str, object]] = {}
+    for service in ("migrate", "api", "ui"):
+        container_id = run(compose + ["ps", "-q", service], env=env, capture=True).stdout.strip()
+        if not container_id:
+            raise GateError(f"The disposable stack has no container for {service}; cannot verify its source identity.")
+        inspected = json.loads(run(["docker", "inspect", container_id], capture=True).stdout)[0]
+        labels = inspected.get("Config", {}).get("Labels", {}) or {}
+        source_role = "go" if service in ("migrate", "api") else "ui"
+        expected_revision = expected[source_role]
+        for label, wanted in (("org.financegame.source.revision", expected_revision),
+                              ("org.financegame.release.pair-sha256", env["RELEASE_PAIR_SHA256"])):
+            if labels.get(label) != wanted:
+                raise GateError(f"Deployed {service} label {label} mismatch: expected {wanted!r}, received {labels.get(label)!r}.")
+        deployed[service] = {"containerId": container_id, "imageId": inspected.get("Image"), "sourceRevision": expected_revision,
+                             "labels": {key: labels.get(key) for key in ("org.financegame.release.id", "org.financegame.release.pair-sha256", "org.financegame.release.qualification", "org.financegame.source.revision")}}
+        if not deployed[service]["imageId"]:
+            raise GateError(f"Could not record the immutable image ID for {service}.")
+    if deployed["api"]["sourceRevision"] != deployed["migrate"]["sourceRevision"]:
+        raise GateError("API and migration containers report different Go source revisions.")
+    return deployed
 
 
 def cleanup_project(compose: list[str], env: dict[str, str], project: str, evidence: Path) -> None:
@@ -201,6 +239,9 @@ def cleanup_project(compose: list[str], env: dict[str, str], project: str, evide
 
 
 def cleanup_temp_directory(temp: Path) -> None:
+    build_sources = temp / "build-sources"
+    if build_sources.exists():
+        shutil.rmtree(build_sources)
     fixture = temp / "fixture"
     if fixture.exists():
         for child in fixture.iterdir():
@@ -213,6 +254,19 @@ def cleanup_temp_directory(temp: Path) -> None:
             raise GateError(f"Refusing to remove unexpected nested fixture directory {child}.")
         child.unlink()
     temp.rmdir()
+
+
+def archive_source(source: Path, revision: str, destination: Path) -> Path:
+    if not shutil.which("tar"):
+        raise GateError("tar is required to materialize immutable capability-gate build contexts.")
+    destination.mkdir(parents=True)
+    archive = destination.parent / f"{destination.name}.tar"
+    run(["git", "-C", str(source), "archive", "--format=tar", "-o", str(archive), revision], capture=True)
+    try:
+        run(["tar", "-xf", str(archive), "-C", str(destination)], capture=True)
+    finally:
+        archive.unlink(missing_ok=True)
+    return destination
 
 
 def write_override(temp: Path, issuer: str) -> Path:
@@ -261,19 +315,45 @@ def main() -> int:
     parser.add_argument("--ui-source", required=True)
     parser.add_argument("--keep", action="store_true", help="retain the project and evidence for inspection")
     parser.add_argument("--evidence-dir", type=Path, help="directory for manifest, logs and checks")
+    parser.add_argument("--no-cache", action="store_true", help="build all source images without Docker cache")
     args = parser.parse_args()
 
     go_path, go_info = source_info(args.go_source, "Go")
     ui_path, ui_info = source_info(args.ui_source, "UI")
+    pair, pair_sha = load_release_pair()
+    try:
+        release_pair.validate_source_revisions(
+            pair, str(go_info["revision"]), str(ui_info["revision"]),
+            go_dirty=bool(go_info["dirty"]), ui_dirty=bool(ui_info["dirty"]),
+        )
+    except release_pair.ReleasePairError as error:
+        raise GateError(str(error)) from error
+    compatibility = pair["compatibility"]
+    fixture_contract = compatibility["capabilityFixture"]
+    rule_pack = compatibility["rulePackVersion"]
+    bundle_revision = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture=True).stdout.strip()
+    bundle_dirty = run(["git", "-C", str(ROOT), "status", "--porcelain"], capture=True).stdout.strip()
+    if bundle_dirty:
+        raise GateError("Bundle checkout is dirty; commit the release controller and gate before writing qualification evidence.")
     if not shutil.which("docker") or not shutil.which("openssl"):
         raise GateError("Docker Compose and openssl are required.")
     project = "fgcap-" + uuid.uuid4().hex[:12]
     port = free_port()
     temp = Path(tempfile.mkdtemp(prefix=project + "-"))
+    build_sources = temp / "build-sources"
+    build_sources.mkdir()
     evidence = args.evidence_dir.resolve() if args.evidence_dir else ROOT / "outputs" / "capability-gates" / project
     evidence.mkdir(parents=True, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith("COMPOSE_")}
-    env.update({"GO_SOURCE": str(go_path), "UI_SOURCE": str(ui_path), "UI_PORT": str(port), "BIND_ADDRESS": "127.0.0.1", "POSTGRES_PASSWORD": secrets.token_urlsafe(32), "CAPABILITY_TEMP_ROOT": str(temp), "CAPABILITY_PROJECT": project})
+    try:
+        go_build_source = archive_source(go_path, str(go_info["revision"]), build_sources / "go")
+        ui_build_source = archive_source(ui_path, str(ui_info["revision"]), build_sources / "ui")
+    except BaseException:
+        cleanup_temp_directory(temp)
+        raise
+    env.update({"GO_SOURCE": str(go_build_source), "UI_SOURCE": str(ui_build_source), "UI_PORT": str(port), "BIND_ADDRESS": "127.0.0.1", "POSTGRES_PASSWORD": secrets.token_urlsafe(32), "CAPABILITY_TEMP_ROOT": str(temp), "CAPABILITY_PROJECT": project,
+                "RELEASE_ID": pair["releaseId"], "RELEASE_PAIR_SHA256": pair_sha, "RELEASE_QUALIFICATION": pair["qualification"]["status"],
+                "GO_SOURCE_REVISION": go_info["revision"], "UI_SOURCE_REVISION": ui_info["revision"]})
     try:
         run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(temp / "tls.key"), "-out", str(temp / "tls.crt"), "-subj", "/CN=oidc", "-addext", "subjectAltName=DNS:oidc", "-days", "1"], capture=True)
         (temp / "tls.crt").chmod(0o644)
@@ -292,7 +372,10 @@ def main() -> int:
     except BaseException:
         cleanup_temp_directory(temp)
         raise
-    manifest: dict[str, object] = {"project": project, "uiPort": port, "goSource": go_info, "uiSource": ui_info, "rulePackVersion": RULE_PACK, "fixtureOnly": True, "evidenceDirectory": str(evidence), "phases": []}
+    manifest: dict[str, object] = {"project": project, "uiPort": port, "goSource": go_info, "uiSource": ui_info,
+                                   "releaseId": pair["releaseId"], "releasePairSha256": pair_sha,
+                                   "qualificationStatus": pair["qualification"]["status"], "compatibility": compatibility,
+                                   "rulePackVersion": rule_pack, "fixtureOnly": True, "evidenceDirectory": str(evidence), "phases": []}
     created = False
     cleanup_attempted = False
     project_cleaned = False
@@ -325,7 +408,11 @@ def main() -> int:
         if networks:
             raise GateError(f"Generated project name unexpectedly already owns networks: {project}")
         created = True
-        run(compose + ["up", "--build", "--detach", "--wait", "db"], env=env)
+        if args.no_cache:
+            run(compose + ["build", "--no-cache", "migrate", "api", "ui"], env=env, capture=True)
+            phase("fresh-build", "passed", noCache=True, goRevision=go_info["revision"], uiRevision=ui_info["revision"])
+        build_flag = ["--no-build"] if args.no_cache else ["--build"]
+        run(compose + ["up", *build_flag, "--detach", "--wait", "db"], env=env)
         # Deliberately wrong credentials prove failed migration is visible and recoverable.
         failed = run(compose + ["run", "--rm", "--no-deps", "-e", "PGPASSWORD=capability-intentionally-wrong", "migrate"], check=False, env=env, capture=True)
         (evidence / "migration-failure.log").write_text((failed.stdout or "")[-20_000:])
@@ -335,7 +422,10 @@ def main() -> int:
             raise GateError(f"Migration failure did not report the expected database credential error:\n{(failed.stdout or '')[-1200:]}")
         phase("migration-connection-failure", "passed", exitCode=failed.returncode)
 
-        run(compose + ["up", "--build", "--detach", "--wait"], env=env)
+        run(compose + ["up", *build_flag, "--detach", "--wait"], env=env)
+        deployed_pair = inspect_deployed_pair(compose, env, {"go": str(go_info["revision"]), "ui": str(ui_info["revision"])})
+        manifest["deployedImages"] = deployed_pair
+        phase("deployed-source-pair", "passed", images=deployed_pair)
         base = f"http://127.0.0.1:{port}"
         wait_http(base + "/health/live")
         _, home_body, _ = wait_http(base + "/households")
@@ -347,11 +437,11 @@ def main() -> int:
         headers = {"Authorization": f"Bearer {token}"}
         catalog = request_json(base, "/api/v1/reference/canadian-rule-packs", token)
         packs = catalog.get("rulePacks", [])
-        if not any(item.get("version") == RULE_PACK for item in packs):
-            raise GateError(f"The explicitly selected rule pack {RULE_PACK} is absent from the API catalog: {json.dumps(catalog)[:1200]}")
+        if not any(item.get("version") == rule_pack for item in packs):
+            raise GateError(f"The explicitly selected rule pack {rule_pack} is absent from the API catalog: {json.dumps(catalog)[:1200]}")
         # A real Nginx-proxied API business endpoint proves proxy routing and auth.
         request_json(base, "/api/v1/reference/canadian-rule-packs", token)
-        phase("api-proxy-and-rule-catalog", "passed", selectedRulePack=RULE_PACK)
+        phase("api-proxy-and-rule-catalog", "passed", selectedRulePack=rule_pack)
 
         person = request_json(base, "/api/v1/people", token, body={"name": "Capability Fixture", "birthDate": "1980-06", "region": "ON", "preferredCurrency": "CAD", "notes": "Disposable SLED-86 fixture"}, expected=201)
         household = request_json(base, "/api/v1/households", token, body={"name": "Capability Fixture Household", "personIds": [person["id"]], "notes": "Disposable SLED-86 fixture"}, expected=201)
@@ -380,7 +470,12 @@ def main() -> int:
             raise GateError(f"Finalized Snapshot response has no content hash: {finalized}")
         scenario = request_json(base, f"/api/v1/households/{household_id}/scenarios", token, body={"name": "Disposable 2026 plan", "baselineSnapshotId": snapshot_id, "baselineSnapshotVersion": finalized.get("draft", {}).get("version", snapshot_version + 1), "startDate": "2026-01-01", "endDate": "2026-12-31", "annualInflationRate": "0", "annualNominalReturnRate": "0", "growthOverrides": []}, expected=201)
         scenario_id = scenario.get("id", scenario.get("scenario", {}).get("id"))
-        compiled = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs", token, body={"rulePackVersion": RULE_PACK}, expected=201)
+        compiled = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs", token, body={"rulePackVersion": rule_pack}, expected=201)
+        compiled_content = compiled.get("content") or compiled.get("compilation", {}).get("content") or {}
+        observed_compiler = {"compiledInputSchemaVersion": compiled_content.get("schemaVersion"), "compilerVersion": compiled_content.get("compilerVersion")}
+        expected_compiler = {"compiledInputSchemaVersion": fixture_contract["compiledInputSchemaVersion"], "compilerVersion": fixture_contract["compilerVersion"]}
+        if observed_compiler != expected_compiler:
+            raise GateError(f"Compiled-input compatibility mismatch: expected {expected_compiler}, received {observed_compiler}.")
         compilation_version = compiled.get("version", compiled.get("compilation", {}).get("version"))
         compilation_hash = compiled.get("contentHash", compiled.get("compilation", {}).get("contentHash"))
         if not compilation_version or not compilation_hash:
@@ -396,7 +491,7 @@ def main() -> int:
         reopened = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
         if reopened.get("id", reopened.get("run", {}).get("id")) != run_id:
             raise GateError("Reopened Run ID does not match the created immutable Run.")
-        comparison = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/comparisons", token, body={"rulePackVersion": RULE_PACK, "baseCashflowBindings": [], "alternativeCashflowBindings": [], "baseMaturityConversions": [], "alternativeMaturityConversions": [], "baseLiabilityRenewalRates": [], "alternativeLiabilityRenewalRates": [], "alternative": {"name": "Unchanged fixture comparison", "annualInflationRate": "0", "annualNominalReturnRate": "0", "growthOverrides": []}}, expected=201)
+        comparison = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/comparisons", token, body={"rulePackVersion": rule_pack, "baseCashflowBindings": [], "alternativeCashflowBindings": [], "baseMaturityConversions": [], "alternativeMaturityConversions": [], "baseLiabilityRenewalRates": [], "alternativeLiabilityRenewalRates": [], "alternative": {"name": "Unchanged fixture comparison", "annualInflationRate": "0", "annualNominalReturnRate": "0", "growthOverrides": []}}, expected=201)
         comparison_alternative = comparison.get("alternativeScenario", {}).get("id")
         if not comparison_alternative:
             raise GateError(f"Comparison response missing alternative Scenario: {comparison}")
@@ -415,11 +510,26 @@ def main() -> int:
         reread_run = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
         if reread_compilation.get("contentHash") != compilation_hash or reread_run.get("id") != run_id:
             raise GateError("Compilation or Run identity changed after comparison.")
+        observed_run = {"timelineCalculationVersion": run_response.get("calculationVersion"), "runArtifactVersion": run_response.get("artifactVersion")}
+        expected_run = {"timelineCalculationVersion": fixture_contract["timelineCalculationVersion"], "runArtifactVersion": fixture_contract["runArtifactVersion"]}
+        if observed_run != expected_run:
+            raise GateError(f"Run compatibility mismatch: expected {expected_run}, received {observed_run}.")
+        result_body = run_response.get("result") or {}
+        report = result_body.get("report") or {}
+        readiness = result_body.get("readiness") or {}
+        observed_report = {"reportSchemaVersion": report.get("schemaVersion"), "reportCalculationVersion": report.get("calculationVersion"),
+                           "readinessSchemaVersion": readiness.get("schemaVersion"), "readinessCalculationVersion": readiness.get("calculationVersion")}
+        expected_report = {key: fixture_contract[key] for key in observed_report}
+        if observed_report != expected_report:
+            raise GateError(f"Run report compatibility mismatch: expected {expected_report}, received {observed_report}.")
+        manifest["observedCompatibility"] = {"rulePackVersion": rule_pack, **observed_compiler, **observed_run, **observed_report}
         manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "alternativeScenarioId": comparison_alternative, "comparisonDeltas": deltas, "missingPackError": missing_code}
         phase("fabricated-household-compile-run-reopen-compare", "passed", artifacts=manifest["artifacts"])
 
         # A future schema marker must fail closed and be recoverable by removing only that marker.
         max_version = int(run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-Atc", "SELECT COALESCE(MAX(version),0) FROM schema_migrations"], capture=True, env=env).stdout.strip())
+        if max_version != compatibility["databaseSchemaVersion"]:
+            raise GateError(f"Database schema mismatch: expected migration {compatibility['databaseSchemaVersion']}, observed {max_version}.")
         sentinel = max_version + 1000
         run(compose + ["exec", "-T", "db", "psql", "-U", "financegame", "-d", "financegame", "-c", f"INSERT INTO schema_migrations(version) VALUES ({sentinel})"], env=env, capture=True)
         mismatch = run(compose + ["run", "--rm", "--no-deps", "migrate"], check=False, env=env, capture=True)
@@ -463,6 +573,19 @@ def main() -> int:
             temp_cleaned = True
             phase("complete", "passed", cleanup="removed")
         print(f"Capability gate passed. Evidence: {evidence}")
+        if not args.keep and args.no_cache:
+            receipt = {
+                "status": "runtime-qualified", "releaseId": pair["releaseId"], "releasePairSha256": pair_sha,
+                "sources": {"go": go_info["revision"], "ui": ui_info["revision"]},
+                "compatibility": compatibility, "observedCompatibility": manifest.get("observedCompatibility"),
+                "databaseSchemaVersion": max_version, "deployedImages": manifest.get("deployedImages"),
+                "bundleRevision": bundle_revision,
+                "completedPhases": [item["name"] for item in manifest["phases"] if item.get("status") == "passed"],
+                "evidenceDirectory": str(evidence), "completedAt": int(time.time()), "cleanup": "removed",
+            }
+            (evidence / "qualification.json").write_text(json.dumps(receipt, indent=2) + "\n")
+            manifest["qualificationReceipt"] = str(evidence / "qualification.json")
+            (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         return 0
     except Exception as error:
         phase("failure", "failed", error=str(error))
