@@ -53,6 +53,25 @@ def source_revision(value: str | None, name: str, pair: dict) -> tuple[str, dict
     raise release_pair.ReleasePairError(f"{name.upper()} override must be a local Git checkout; remote contexts must use the manifest's pinned source pair.")
 
 
+def deployed_schema_version(go_source: dict[str, object], pair: dict) -> int:
+    if go_source["mode"] != "local-override":
+        return pair["compatibility"]["databaseSchemaVersion"]
+    migration_dir = Path(str(go_source["path"])) / "internal" / "migrations" / "sql"
+    versions = []
+    for path in migration_dir.glob("*.sql"):
+        match = re.match(r"^(\d+)_.*\.sql$", path.name)
+        if not match:
+            raise release_pair.ReleasePairError(f"Invalid Go migration filename: {path.name}")
+        version = int(match.group(1))
+        if version < 1:
+            raise release_pair.ReleasePairError(f"Invalid Go migration version: {path.name}")
+        versions.append(version)
+    versions.sort()
+    if not versions or versions != list(range(1, len(versions) + 1)):
+        raise release_pair.ReleasePairError(f"Go source migration versions must be consecutive from 1: {migration_dir}")
+    return len(versions)
+
+
 def read_backup_reference(path_text: str, previous: dict) -> dict:
     path = Path(path_text).expanduser().resolve()
     try:
@@ -100,6 +119,7 @@ def read_previous_release(path_text: str) -> dict:
 def resolve_config(pair: dict, contract_sha: str, env: dict[str, str]) -> tuple[dict, dict[str, object]]:
     go_revision, go_source = source_revision(env.get("GO_SOURCE"), "go", pair)
     ui_revision, ui_source = source_revision(env.get("UI_SOURCE"), "ui", pair)
+    schema_version = deployed_schema_version(go_source, pair)
     env.update({"RELEASE_ID": pair["releaseId"], "RELEASE_PAIR_SHA256": contract_sha,
                 "RELEASE_QUALIFICATION": "local-override" if "local-override" in (go_source["mode"], ui_source["mode"]) else pair["qualification"]["status"],
                 "GO_SOURCE_REVISION": go_revision, "UI_SOURCE_REVISION": ui_revision})
@@ -134,7 +154,7 @@ def resolve_config(pair: dict, contract_sha: str, env: dict[str, str]) -> tuple[
     identity = {"releaseId": pair["releaseId"], "releasePairSha256": contract_sha,
                 "qualification": env["RELEASE_QUALIFICATION"], "goSource": go_source, "uiSource": ui_source,
                 "apiAndMigrationContext": go_context, "uiContext": expected_contexts["ui"],
-                "databaseSchemaVersion": pair["compatibility"]["databaseSchemaVersion"]}
+                "databaseSchemaVersion": schema_version}
     return config, identity
 
 
@@ -189,7 +209,12 @@ def deployment_up(backup_reference: str, previous_release_reference: str) -> int
         previous_sources = previous.get("sources", {})
         same_pair = (previous.get("releasePairSha256") == contract_sha
                      and previous_sources.get("go", {}).get("revision") == go_revision
-                     and previous_sources.get("ui", {}).get("revision") == ui_revision)
+                     and previous_sources.get("ui", {}).get("revision") == ui_revision
+                     and previous.get("databaseSchemaVersion") == identity["databaseSchemaVersion"]
+                     and not previous_sources.get("go", {}).get("dirty", False)
+                     and not previous_sources.get("ui", {}).get("dirty", False)
+                     and not go_source.get("dirty", False)
+                     and not ui_source.get("dirty", False))
         if same_pair:
             if backup_reference:
                 raise release_pair.ReleasePairError("The current release pair is already active; omit --backup-reference for a restart.")
@@ -209,7 +234,7 @@ def deployment_up(backup_reference: str, previous_release_reference: str) -> int
     attempt = {
         "attemptId": attempt_id, "startedAt": now, "state": "starting", "project": project,
         "installKind": install_kind, "releaseId": pair["releaseId"], "qualification": qualification,
-        "releasePairSha256": contract_sha,
+        "releasePairSha256": contract_sha, "databaseSchemaVersion": identity["databaseSchemaVersion"],
         "sources": {"go": go_source, "ui": ui_source},
         "compatibility": pair["compatibility"], "resolvedContexts": identity,
         "previousRelease": previous, "backupReference": backup,
@@ -218,7 +243,7 @@ def deployment_up(backup_reference: str, previous_release_reference: str) -> int
     print(f"Starting {qualification} {pair['releaseId']} (pair {contract_sha}).")
     print(f"Go/migration source: {go_revision} ({go_source['mode']}); UI source: {ui_revision} ({ui_source['mode']}).")
     fixture = pair["compatibility"]["capabilityFixture"]
-    print(f"Compatibility: database schema {pair['compatibility']['databaseSchemaVersion']}, rule pack {pair['compatibility']['rulePackVersion']}, compiler {fixture['compilerVersion']} / input schema {fixture['compiledInputSchemaVersion']}.")
+    print(f"Compatibility: database schema {identity['databaseSchemaVersion']} (manifest {pair['compatibility']['databaseSchemaVersion']}), rule pack {pair['compatibility']['rulePackVersion']}, compiler {fixture['compilerVersion']} / input schema {fixture['compiledInputSchemaVersion']}.")
     if install_kind == "upgrade":
         print(f"Upgrade references previous release {previous.get('releaseId')} and backup {backup['location']}.")
     else:
@@ -249,7 +274,7 @@ def deployment_up(backup_reference: str, previous_release_reference: str) -> int
         atomic_write(attempt_path, attempt)
         atomic_write(active_path, {
             "releaseId": pair["releaseId"], "releasePairSha256": contract_sha,
-            "qualification": qualification, "databaseSchemaVersion": pair["compatibility"]["databaseSchemaVersion"],
+            "qualification": qualification, "databaseSchemaVersion": identity["databaseSchemaVersion"],
             "sources": {"go": go_source, "ui": ui_source}, "containers": attempt["containers"],
             "deploymentRecord": str(attempt_path), "startedAt": attempt["completedAt"],
         })

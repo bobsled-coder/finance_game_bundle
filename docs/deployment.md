@@ -30,8 +30,13 @@ stops startup with expected and observed revisions in the diagnostic.
 Set `GO_SOURCE` and `UI_SOURCE` in `.env` to local checkout paths when preferred.
 Use `just up` with these overrides: it records each checkout's actual SHA and
 dirty state, labels the deployment `local-override`, and does not identify it
-as the pinned release. The capability gate accepts only clean checkouts whose
-full SHAs match the manifest.
+as the pinned release. For a local Go override, the controller reads and
+validates the consecutive migration filenames and records that checkout's
+latest schema version alongside the manifest compatibility contract. A dirty
+local override, changed source pair, or changed schema identity requires a
+backup reference before starting the migration job, even when its Git HEAD
+matches the active record. The capability gate accepts only clean checkouts
+whose full SHAs match the manifest.
 
 ## Startup order
 
@@ -55,8 +60,9 @@ The API checks that the database schema matches its compiled migration version.
 Back up the database before upgrading. After a migration advances the schema, a
 rollback to an older API may require restoring the matching database backup.
 `just up` records each deployment attempt under `.release-deployments/`. A
-restart with the already recorded pair needs no new backup. When the pair or
-compatibility contract changes and the project volume exists, supply a JSON
+restart with the already recorded clean pair and schema needs no new backup.
+When the pair or schema changes, or either local override is dirty, and the
+project volume exists, supply a JSON
 backup reference with `just up path/to/backup-reference.json`; it must name the
 prior release, database schema, backup location and creation time, and a
 SHA-256 checksum. If this is a pre-controller volume without an active
