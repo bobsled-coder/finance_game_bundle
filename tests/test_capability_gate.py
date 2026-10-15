@@ -103,6 +103,20 @@ class RunAssertionTests(unittest.TestCase):
             )
 
 
+class ComposeBuildFailureTests(unittest.TestCase):
+    def test_retains_build_output_in_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            failure = subprocess.CompletedProcess([], 1, stdout="image build failed: missing Dockerfile\n")
+            with patch.object(capability_gate, "run", return_value=failure):
+                with self.assertRaisesRegex(capability_gate.GateError, "compose-build-failure.log"):
+                    capability_gate.run_compose_build(["docker", "compose"], {}, evidence)
+            self.assertEqual(
+                (evidence / "compose-build-failure.log").read_text(),
+                "image build failed: missing Dockerfile\n",
+            )
+
+
 class CleanupOwnershipTests(unittest.TestCase):
     def test_refuses_to_remove_project_when_a_container_has_another_label(self) -> None:
         project = "fgcap-test"

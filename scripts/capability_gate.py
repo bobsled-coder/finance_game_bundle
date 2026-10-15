@@ -71,6 +71,19 @@ def run(command: list[str], *, check: bool = True, env: dict[str, str] | None = 
     return result
 
 
+def run_compose_build(compose: list[str], env: dict[str, str], evidence: Path) -> None:
+    command = compose + ["up", "--build", "--detach", "--wait"]
+    result = run(command, check=False, env=env, capture=True)
+    if result.returncode:
+        output = result.stdout or ""
+        log_path = evidence / "compose-build-failure.log"
+        log_path.write_text(output[-200_000:])
+        raise GateError(
+            f"Compose build or startup failed ({result.returncode}); see {log_path}.\n"
+            + output[-6000:]
+        )
+
+
 def source_info(path_text: str, label: str) -> tuple[Path, dict[str, object]]:
     path = Path(path_text).expanduser().resolve()
     if not path.is_dir():
@@ -379,7 +392,7 @@ def main() -> int:
             raise GateError(f"Migration failure did not report the expected database credential error:\n{(failed.stdout or '')[-1200:]}")
         phase("migration-connection-failure", "passed", exitCode=failed.returncode)
 
-        run(compose + ["up", "--build", "--detach", "--wait"], env=env)
+        run_compose_build(compose, env, evidence)
         base = f"http://127.0.0.1:{port}"
         wait_http(base + "/health/live")
         _, home_body, _ = wait_http(base + "/households")
