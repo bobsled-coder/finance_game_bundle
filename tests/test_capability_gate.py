@@ -1,0 +1,118 @@
+import json
+import subprocess
+import unittest
+from unittest.mock import patch
+
+from scripts import capability_gate
+
+
+class InspectConfigTests(unittest.TestCase):
+    def inspect(self, *, volume_name: str, network_name: str) -> None:
+        project = "fgcap-test"
+        config = {
+            "name": project,
+            "volumes": {"postgres_data": {"name": volume_name}},
+            "networks": {"backend": {"name": network_name}},
+            "services": {
+                "db": {"volumes": [], "ports": []},
+                "api": {"volumes": [], "ports": []},
+                "ui": {
+                    "volumes": [],
+                    "ports": [{"host_ip": "127.0.0.1", "target": 8080}],
+                },
+            },
+        }
+        result = subprocess.CompletedProcess([], 0, stdout=json.dumps(config))
+        env = {
+            "CAPABILITY_PROJECT": project,
+            "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-test",
+        }
+        with patch.object(capability_gate, "run", return_value=result):
+            capability_gate.inspect_config(["docker", "compose"], env)
+
+    def test_accepts_project_scoped_resource_names(self) -> None:
+        self.inspect(
+            volume_name="fgcap-test_postgres_data",
+            network_name="fgcap-test_backend",
+        )
+
+    def test_rejects_globally_named_volume(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "volume"):
+            self.inspect(volume_name="postgres_data", network_name="fgcap-test_backend")
+
+    def test_rejects_globally_named_network(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "network"):
+            self.inspect(volume_name="fgcap-test_postgres_data", network_name="backend")
+
+    def test_rejects_different_compose_project(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "expected isolated project"):
+            self.inspect_config_with_project("finance_game_bundle")
+
+    def inspect_config_with_project(self, project: str) -> None:
+        config = {
+            "name": project,
+            "volumes": {},
+            "networks": {},
+            "services": {"ui": {"volumes": [], "ports": [{"host_ip": "127.0.0.1"}]}},
+        }
+        result = subprocess.CompletedProcess([], 0, stdout=json.dumps(config))
+        env = {"CAPABILITY_PROJECT": "fgcap-test", "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-test"}
+        with patch.object(capability_gate, "run", return_value=result):
+            capability_gate.inspect_config(["docker", "compose"], env)
+
+
+class RunAssertionTests(unittest.TestCase):
+    def test_accepts_expected_immutable_run_and_report(self) -> None:
+        capability_gate.assert_run_artifact(
+            {"id": "run-1", "status": "completed", "compilationHash": "c", "resultHash": "r"},
+            "run-1",
+            "c",
+            "r",
+        )
+        capability_gate.assert_fixture_report(
+            {
+                "summary": {
+                    "periodCount": 12,
+                    "openingNetWorth": "100000.10",
+                    "closingNetWorth": "100000.10",
+                }
+            }
+        )
+
+    def test_rejects_changed_run_hashes(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "hash changed"):
+            capability_gate.assert_run_artifact(
+                {"id": "run-1", "status": "completed", "compilationHash": "c", "resultHash": "changed"},
+                "run-1",
+                "c",
+                "r",
+            )
+
+    def test_rejects_unexpected_projection_total(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "does not match"):
+            capability_gate.assert_fixture_report(
+                {
+                    "summary": {
+                        "periodCount": 12,
+                        "openingNetWorth": "100000.10",
+                        "closingNetWorth": "100000.09",
+                    }
+                }
+            )
+
+
+class CapabilityOverrideTests(unittest.TestCase):
+    def test_selects_fixed_test_only_api_target(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            override_path = capability_gate.write_override(Path(directory), "https://oidc:8443/")
+            override = json.loads(override_path.read_text())
+
+        self.assertEqual(override["services"]["api"]["build"]["target"], "capability-api")
+        self.assertEqual(capability_gate.RULE_PACK, "canadian-planning-rules-test-v1")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -29,3 +29,6 @@ config:
 # Requires explicit, clean local Go and UI source checkouts.
 capability-gate go_source ui_source:
     python3 scripts/capability_gate.py --go-source "{{go_source}}" --ui-source "{{ui_source}}"
+
+test-capability-gate:
+    python3 -m unittest discover -s tests -v

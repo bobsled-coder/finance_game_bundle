@@ -11,7 +11,6 @@ from pathlib import Path
 import secrets
 import signal
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -22,7 +21,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RULE_PACK = "canadian-planning-rules-v1"
+RULE_PACK = "canadian-planning-rules-test-v1"
 TIMEOUT = 90
 
 
@@ -92,10 +91,10 @@ def source_info(path_text: str, label: str) -> tuple[Path, dict[str, object]]:
     return path, {"path": str(path), "revision": revision, "dirty": False}
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def candidate_port() -> int:
+    # Select from the dynamic/private range without opening a host socket. The
+    # Compose bind is the authoritative collision check and reports the port.
+    return 49152 + secrets.randbelow(16384)
 
 
 def wait_http(url: str, *, expected: int = 200, headers: dict[str, str] | None = None, timeout: int = TIMEOUT) -> tuple[int, bytes, dict[str, str]]:
@@ -139,6 +138,28 @@ def request_json(base: str, path: str, token: str, *, body: dict | None = None, 
     return value
 
 
+def assert_run_artifact(run: dict, run_id: str, compilation_hash: str, result_hash: str) -> None:
+    if run.get("id") != run_id or run.get("status") != "completed":
+        raise GateError(f"Reopened Scenario Run identity or status changed: {run}")
+    if run.get("compilationHash") != compilation_hash or run.get("resultHash") != result_hash:
+        raise GateError(
+            "Scenario Run frozen input or result hash changed after reopen: "
+            f"compilationHash={run.get('compilationHash')!r}, resultHash={run.get('resultHash')!r}"
+        )
+
+
+def assert_fixture_report(report: dict) -> None:
+    summary = report.get("summary", {})
+    actual = {
+        "periodCount": summary.get("periodCount"),
+        "openingNetWorth": summary.get("openingNetWorth"),
+        "closingNetWorth": summary.get("closingNetWorth"),
+    }
+    expected = {"periodCount": 12, "openingNetWorth": "100000.10", "closingNetWorth": "100000.10"}
+    if actual != expected:
+        raise GateError(f"Scenario Run report does not match the fabricated fixture: expected {expected}, got {actual}.")
+
+
 def make_token(key_path: Path, issuer: str, audience: str) -> str:
     now = int(time.time())
     header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "capability"}, separators=(",", ":")).encode())
@@ -151,13 +172,16 @@ def make_token(key_path: Path, issuer: str, audience: str) -> str:
 def inspect_config(compose: list[str], env: dict[str, str]) -> None:
     result = run(compose + ["config", "--format", "json"], capture=True, env=env)
     config = json.loads(result.stdout)
-    if config.get("name") is None:
-        raise GateError("Compose did not resolve the isolated project name.")
+    project = env["CAPABILITY_PROJECT"]
+    if config.get("name") != project:
+        raise GateError(
+            f"Compose resolved project name {config.get('name')!r}; expected isolated project {project!r}."
+        )
     for name, volume in config.get("volumes", {}).items():
-        if volume.get("external") or volume.get("name") not in (None, name, f"{env['CAPABILITY_PROJECT']}_{name}"):
+        if volume.get("external") or volume.get("name") not in (None, f"{project}_{name}"):
             raise GateError(f"Refusing non-project-scoped or external volume {name!r}.")
     for name, network in config.get("networks", {}).items():
-        if network.get("external") or network.get("name") not in (None, name, f"{env['CAPABILITY_PROJECT']}_{name}"):
+        if network.get("external") or network.get("name") not in (None, f"{project}_{name}"):
             raise GateError(f"Refusing non-project-scoped or external network {name!r}.")
     for service_name, service in config.get("services", {}).items():
         if service.get("container_name"):
@@ -219,6 +243,7 @@ def write_override(temp: Path, issuer: str) -> Path:
     override = {
         "services": {
             "api": {
+                "build": {"target": "capability-api"},
                 "environment": {
                     "OIDC_ISSUER": issuer,
                     "OIDC_AUDIENCE": "finance-game-capability",
@@ -267,8 +292,21 @@ def main() -> int:
     ui_path, ui_info = source_info(args.ui_source, "UI")
     if not shutil.which("docker") or not shutil.which("openssl"):
         raise GateError("Docker Compose and openssl are required.")
+    daemon = run(["docker", "info"], check=False, capture=True)
+    if daemon.returncode:
+        raise GateError(
+            "Docker daemon is unavailable or the current user cannot access it. "
+            "Start Docker and check access to its socket.\n"
+            + (daemon.stdout or "")[-2000:]
+        )
+    compose_version = run(["docker", "compose", "version"], check=False, capture=True)
+    if compose_version.returncode:
+        raise GateError(
+            "Docker Compose is unavailable; install the Docker Compose plugin.\n"
+            + (compose_version.stdout or "")[-2000:]
+        )
     project = "fgcap-" + uuid.uuid4().hex[:12]
-    port = free_port()
+    port = candidate_port()
     temp = Path(tempfile.mkdtemp(prefix=project + "-"))
     evidence = args.evidence_dir.resolve() if args.evidence_dir else ROOT / "outputs" / "capability-gates" / project
     evidence.mkdir(parents=True, exist_ok=True)
@@ -315,7 +353,13 @@ def main() -> int:
         signal.signal(signal.SIGINT, interrupt)
         signal.signal(signal.SIGTERM, interrupt)
         inspect_config(compose, env)
-        existing = run(compose + ["ps", "-aq"], check=False, env=env, capture=True).stdout.strip()
+        existing_result = run(compose + ["ps", "-aq"], check=False, env=env, capture=True)
+        if existing_result.returncode:
+            raise GateError(
+                f"Could not verify that generated Compose project {project} is isolated:\n"
+                + (existing_result.stdout or "")[-2000:]
+            )
+        existing = existing_result.stdout.strip()
         if existing:
             raise GateError(f"Generated project name unexpectedly already owns containers: {project}")
         volumes = run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip()
@@ -393,9 +437,13 @@ def main() -> int:
         run_id = run_response.get("id", run_response.get("run", {}).get("id"))
         if run_response.get("status") != "completed":
             raise GateError(f"The fixture Run did not complete successfully: {run_response}")
+        result_hash = run_response.get("resultHash")
+        if not result_hash or run_response.get("compilationHash") != compilation_hash:
+            raise GateError(f"The fixture Run did not retain its compiled input and result hashes: {run_response}")
+        report = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token)
+        assert_fixture_report(report)
         reopened = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
-        if reopened.get("id", reopened.get("run", {}).get("id")) != run_id:
-            raise GateError("Reopened Run ID does not match the created immutable Run.")
+        assert_run_artifact(reopened, run_id, compilation_hash, result_hash)
         comparison = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/comparisons", token, body={"rulePackVersion": RULE_PACK, "baseCashflowBindings": [], "alternativeCashflowBindings": [], "baseMaturityConversions": [], "alternativeMaturityConversions": [], "baseLiabilityRenewalRates": [], "alternativeLiabilityRenewalRates": [], "alternative": {"name": "Unchanged fixture comparison", "annualInflationRate": "0", "annualNominalReturnRate": "0", "growthOverrides": []}}, expected=201)
         comparison_alternative = comparison.get("alternativeScenario", {}).get("id")
         if not comparison_alternative:
@@ -413,9 +461,11 @@ def main() -> int:
             raise GateError("Snapshot hash changed after Run/comparison; immutable artifact preservation failed.")
         reread_compilation = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs/{compilation_version}", token)
         reread_run = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
-        if reread_compilation.get("contentHash") != compilation_hash or reread_run.get("id") != run_id:
+        assert_run_artifact(reread_run, run_id, compilation_hash, result_hash)
+        if reread_compilation.get("contentHash") != compilation_hash:
             raise GateError("Compilation or Run identity changed after comparison.")
-        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "alternativeScenarioId": comparison_alternative, "comparisonDeltas": deltas, "missingPackError": missing_code}
+        assert_fixture_report(request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token))
+        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonDeltas": deltas, "missingPackError": missing_code}
         phase("fabricated-household-compile-run-reopen-compare", "passed", artifacts=manifest["artifacts"])
 
         # A future schema marker must fail closed and be recoverable by removing only that marker.
@@ -450,7 +500,9 @@ def main() -> int:
         if ready_after_recovery.returncode:
             raise GateError("API readiness did not recover after removing the inserted schema marker and restarting the API.")
         wait_http(base + "/api/v1/reference/canadian-rule-packs", headers=headers, timeout=TIMEOUT)
-        request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
+        recovered_run = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
+        assert_run_artifact(recovered_run, run_id, compilation_hash, result_hash)
+        assert_fixture_report(request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token))
         phase("api-offline-and-recovery", "passed", outageCode=unavailable)
         collect_logs()
         if args.keep:
