@@ -458,9 +458,22 @@ def main() -> int:
         reopened = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}", token)
         assert_run_artifact(reopened, run_id, compilation_hash, result_hash)
         comparison = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/comparisons", token, body={"rulePackVersion": RULE_PACK, "baseCashflowBindings": [], "alternativeCashflowBindings": [], "baseMaturityConversions": [], "alternativeMaturityConversions": [], "baseLiabilityRenewalRates": [], "alternativeLiabilityRenewalRates": [], "alternative": {"name": "Unchanged fixture comparison", "annualInflationRate": "0", "annualNominalReturnRate": "0", "growthOverrides": []}}, expected=201)
+        comparison_id = comparison.get("comparisonId")
+        if not comparison_id:
+            raise GateError(f"Comparison response missing immutable comparison ID: {comparison}")
+        comparison_history = request_json(base, f"/api/v1/households/{household_id}/comparisons", token)
+        comparison_history_ids = [item.get("comparisonId") for item in comparison_history.get("comparisons", [])]
+        if comparison_id not in comparison_history_ids:
+            raise GateError(f"Household comparison history did not include saved comparison {comparison_id}: {comparison_history}")
+        reopened_comparison = request_json(base, f"/api/v1/households/{household_id}/comparisons/{comparison_id}", token)
+        if reopened_comparison.get("comparisonId") != comparison_id:
+            raise GateError("Reopened comparison ID does not match the saved immutable comparison.")
         comparison_alternative = comparison.get("alternativeScenario", {}).get("id")
         if not comparison_alternative:
             raise GateError(f"Comparison response missing alternative Scenario: {comparison}")
+        comparison_alternative_run = comparison.get("alternativeRunId")
+        if not comparison_alternative_run:
+            raise GateError(f"Comparison response missing alternative Run: {comparison}")
         alternative = comparison.get("alternativeScenario", {})
         if alternative.get("baselineSnapshotId") != snapshot_id or comparison.get("comparison", {}).get("baseScenarioId") != scenario_id:
             raise GateError("Comparison did not preserve the expected base Scenario and finalized Snapshot references.")
@@ -469,6 +482,42 @@ def main() -> int:
             raise GateError(f"An unchanged comparison should have exact zero summary deltas, received {deltas}.")
         if comparison.get("comparison", {}).get("baseRunId") != run_id:
             raise GateError("Comparison did not reuse the recorded base Run.")
+        # Run identity includes the household's Goal/Guardrail inputs. Add a
+        # fabricated Goal so this same compilation produces a distinct Run.
+        goal = request_json(base, f"/api/v1/households/{household_id}/goals", token, body={"displayName": "Disposable history fixture goal", "goalType": "emergency_fund", "priority": "must", "targetAmount": "25000.00", "targetDate": "2026-12-31", "measureKey": "period_end_household_net_worth", "definitionVersion": "household-net-worth-goals-v1", "effectiveStart": "2026-01-01", "effectiveEnd": "2026-12-31"}, expected=201)
+        second_run_response = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs/{compilation_version}/runs", token, body={}, expected=201)
+        second_run_id = second_run_response.get("id", second_run_response.get("run", {}).get("id"))
+        if not second_run_id or second_run_id == run_id or second_run_response.get("status") != "completed":
+            raise GateError(f"A second immutable Run was not created for history pagination: {second_run_response}")
+        household_history_ids = []
+        history_cursor = ""
+        household_history_page_count = 0
+        for _ in range(10):
+            query = f"/api/v1/households/{household_id}/runs?limit=1"
+            if history_cursor:
+                query += f"&cursor={history_cursor}"
+            history_page = request_json(base, query, token)
+            page_runs = history_page.get("runs", [])
+            if len(page_runs) != 1:
+                raise GateError(f"Household Run history page should contain exactly one result: {history_page}")
+            household_history_page_count += 1
+            household_history_ids.extend(item.get("id") for item in page_runs)
+            history_cursor = history_page.get("nextCursor") or ""
+            if not history_cursor:
+                break
+        expected_household_run_ids = {run_id, second_run_id, comparison_alternative_run}
+        if history_cursor or household_history_page_count < 3 or len(household_history_ids) != len(expected_household_run_ids) or set(household_history_ids) != expected_household_run_ids:
+            raise GateError(f"Household Run history continuation did not recover all expected immutable Runs: {household_history_ids}")
+        scenario_history_first = request_json(base, f"/api/v1/households/{household_id}/runs?scenarioId={scenario_id}&limit=1", token)
+        scenario_history_first_ids = [item.get("id") for item in scenario_history_first.get("runs", [])]
+        scenario_cursor = scenario_history_first.get("nextCursor")
+        if len(scenario_history_first_ids) != 1 or not scenario_cursor:
+            raise GateError(f"Scenario Run history did not return one result and a continuation cursor: {scenario_history_first}")
+        scenario_history_next = request_json(base, f"/api/v1/households/{household_id}/runs?scenarioId={scenario_id}&limit=1&cursor={scenario_cursor}", token)
+        scenario_history_ids_list = [*scenario_history_first_ids, *(item.get("id") for item in scenario_history_next.get("runs", []))]
+        scenario_history_ids = set(scenario_history_ids_list)
+        if len(scenario_history_next.get("runs", [])) != 1 or scenario_history_next.get("nextCursor") or scenario_history_ids != {run_id, second_run_id}:
+            raise GateError(f"Scenario-filtered Run history continuation did not recover both immutable attempts: {scenario_history_next}")
         reread_snapshot = request_json(base, f"/api/v1/households/{household_id}/snapshots/{snapshot_id}", token)
         if reread_snapshot.get("finalized", {}).get("contentHash") != finalized_hash:
             raise GateError("Snapshot hash changed after Run/comparison; immutable artifact preservation failed.")
@@ -478,7 +527,7 @@ def main() -> int:
         if reread_compilation.get("contentHash") != compilation_hash:
             raise GateError("Compilation or Run identity changed after comparison.")
         assert_fixture_report(request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token))
-        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonDeltas": deltas, "missingPackError": missing_code}
+        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "secondRunId": second_run_id, "historyGoalId": goal.get("id"), "householdRunHistoryPageIds": household_history_ids, "householdRunHistoryPageCount": household_history_page_count, "scenarioRunHistoryIds": sorted(scenario_history_ids), "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonId": comparison_id, "comparisonHistoryContainsSavedId": comparison_id in comparison_history_ids, "comparisonDeltas": deltas, "missingPackError": missing_code}
         phase("fabricated-household-compile-run-reopen-compare", "passed", artifacts=manifest["artifacts"])
 
         # A future schema marker must fail closed and be recoverable by removing only that marker.
