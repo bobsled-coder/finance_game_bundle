@@ -1,5 +1,7 @@
 import json
 import subprocess
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -99,6 +101,30 @@ class RunAssertionTests(unittest.TestCase):
                     }
                 }
             )
+
+
+class CleanupOwnershipTests(unittest.TestCase):
+    def test_refuses_to_remove_project_when_a_container_has_another_label(self) -> None:
+        project = "fgcap-test"
+        compose = ["docker", "compose", "--project-name", project]
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if command == compose + ["ps", "-aq"]:
+                return subprocess.CompletedProcess(command, 0, stdout="container-1\n")
+            if command[:3] == ["docker", "volume", "ls"] or command[:3] == ["docker", "network", "ls"]:
+                return subprocess.CompletedProcess(command, 0, stdout="")
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, stdout="another-project\n")
+            if command[:2] == compose[:2] and "down" in command:
+                self.fail("cleanup must not run when ownership verification fails")
+            self.fail(f"unexpected cleanup command: {command}")
+
+        with TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            with patch.object(capability_gate, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(capability_gate.GateError, "unexpected Compose project label"):
+                    capability_gate.cleanup_project(compose, {}, project, evidence)
+            self.assertEqual(list(evidence.iterdir()), [])
 
 
 class CapabilityOverrideTests(unittest.TestCase):
