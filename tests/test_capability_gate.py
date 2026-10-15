@@ -118,6 +118,57 @@ class ComposeBuildFailureTests(unittest.TestCase):
 
 
 class CleanupOwnershipTests(unittest.TestCase):
+    def test_cleanup_removes_only_owned_images_after_compose_resources(self) -> None:
+        project = "fgcap-test"
+        compose = ["docker", "compose", "--project-name", project]
+        images = capability_gate.capability_images(project)
+        present_images = {images[1]}
+        down_completed = False
+        removed_images: list[str] = []
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal down_completed
+            if command == compose + ["ps", "-aq"]:
+                return subprocess.CompletedProcess(command, 0, stdout="" if down_completed else "container-1\n")
+            if command[:3] == ["docker", "volume", "ls"]:
+                return subprocess.CompletedProcess(command, 0, stdout="volume-1\n" if not down_completed else "")
+            if command[:3] == ["docker", "network", "ls"]:
+                return subprocess.CompletedProcess(command, 0, stdout="network-1\n" if not down_completed else "")
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, stdout=project + "\n")
+            if command[:3] in (["docker", "volume", "inspect"], ["docker", "network", "inspect"]):
+                return subprocess.CompletedProcess(command, 0, stdout=project + "\n")
+            if command[:3] == ["docker", "image", "inspect"]:
+                image = command[-1]
+                if image not in images:
+                    self.fail(f"cleanup inspected an image outside this run: {image}")
+                if "-f" in command:
+                    if image in present_images:
+                        return subprocess.CompletedProcess(command, 0, stdout=project + "\n")
+                    return subprocess.CompletedProcess(command, 1, stdout="Error: No such image\n")
+                if image in present_images:
+                    return subprocess.CompletedProcess(command, 0, stdout=image + "\n")
+                return subprocess.CompletedProcess(command, 1, stdout="Error: No such image\n")
+            if command[:2] == compose[:2] and "down" in command:
+                down_completed = True
+                return subprocess.CompletedProcess(command, 0, stdout="project removed\n")
+            if command[:3] == ["docker", "image", "rm"]:
+                self.assertTrue(down_completed, "project containers must be removed before their images")
+                image = command[-1]
+                self.assertIn(image, present_images)
+                removed_images.append(image)
+                present_images.remove(image)
+                return subprocess.CompletedProcess(command, 0, stdout=image + "\n")
+            self.fail(f"unexpected cleanup command: {command}")
+
+        with TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            with patch.object(capability_gate, "run", side_effect=fake_run):
+                capability_gate.cleanup_project(compose, {}, project, evidence)
+            self.assertEqual((evidence / "cleanup.log").read_text(), "project removed\n")
+
+        self.assertEqual(removed_images, [images[1]])
+
     def test_refuses_to_remove_project_when_a_container_has_another_label(self) -> None:
         project = "fgcap-test"
         compose = ["docker", "compose", "--project-name", project]
@@ -127,6 +178,8 @@ class CleanupOwnershipTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout="container-1\n")
             if command[:3] == ["docker", "volume", "ls"] or command[:3] == ["docker", "network", "ls"]:
                 return subprocess.CompletedProcess(command, 0, stdout="")
+            if command[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(command, 1, stdout="Error: No such image\n")
             if command[:2] == ["docker", "inspect"]:
                 return subprocess.CompletedProcess(command, 0, stdout="another-project\n")
             if command[:2] == compose[:2] and "down" in command:
@@ -140,6 +193,28 @@ class CleanupOwnershipTests(unittest.TestCase):
                     capability_gate.cleanup_project(compose, {}, project, evidence)
             self.assertEqual(list(evidence.iterdir()), [])
 
+    def test_refuses_to_remove_a_capability_image_owned_by_another_project(self) -> None:
+        project = "fgcap-test"
+        compose = ["docker", "compose", "--project-name", project]
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if command == compose + ["ps", "-aq"]:
+                return subprocess.CompletedProcess(command, 0, stdout="")
+            if command[:3] == ["docker", "volume", "ls"] or command[:3] == ["docker", "network", "ls"]:
+                return subprocess.CompletedProcess(command, 0, stdout="")
+            if command[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, stdout="another-project\n")
+            if command[:2] == compose[:2] and "down" in command:
+                self.fail("cleanup must not run when image ownership verification fails")
+            self.fail(f"unexpected cleanup command: {command}")
+
+        with TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            with patch.object(capability_gate, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(capability_gate.GateError, "unexpected capability project label"):
+                    capability_gate.cleanup_project(compose, {}, project, evidence)
+            self.assertEqual(list(evidence.iterdir()), [])
+
 
 class CapabilityOverrideTests(unittest.TestCase):
     def test_selects_fixed_test_only_api_target(self) -> None:
@@ -147,11 +222,15 @@ class CapabilityOverrideTests(unittest.TestCase):
         from tempfile import TemporaryDirectory
 
         with TemporaryDirectory() as directory:
-            override_path = capability_gate.write_override(Path(directory), "https://oidc:8443/")
+            project = "fgcap-test"
+            override_path = capability_gate.write_override(Path(directory), "https://oidc:8443/", project)
             override = json.loads(override_path.read_text())
 
         self.assertEqual(override["services"]["api"]["build"]["target"], "capability-api")
         self.assertEqual(capability_gate.RULE_PACK, "canadian-planning-rules-test-v1")
+        for service, image in zip(("migrate", "api", "ui"), capability_gate.capability_images(project)):
+            self.assertEqual(override["services"][service]["image"], image)
+            self.assertEqual(override["services"][service]["build"]["labels"][capability_gate.IMAGE_LABEL], project)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 RULE_PACK = "canadian-planning-rules-test-v1"
 TIMEOUT = 90
+IMAGE_LABEL = "io.bobsled.capability-project"
 
 
 class GateError(RuntimeError):
@@ -220,6 +221,14 @@ def cleanup_project(compose: list[str], env: dict[str, str], project: str, evide
     resources.extend(("volume", item, ["docker", "volume", "inspect", "-f", "{{ index .Labels \"com.docker.compose.project\" }}", item]) for item in volumes)
     networks = run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip().split()
     resources.extend(("network", item, ["docker", "network", "inspect", "-f", "{{ index .Labels \"com.docker.compose.project\" }}", item]) for item in networks)
+    images = capability_images(project)
+    present_images: list[str] = []
+    for item in images:
+        inspected = run(["docker", "image", "inspect", "-f", f"{{{{ index .Config.Labels \"{IMAGE_LABEL}\" }}}}", item], check=False, capture=True)
+        if inspected.returncode == 0:
+            present_images.append(item)
+            if inspected.stdout.strip() != project:
+                raise GateError(f"Refusing cleanup: image {item} has unexpected capability project label {inspected.stdout.strip()!r}.")
     for kind, item, inspect in resources:
         label = run(inspect, capture=True).stdout.strip()
         if label != project:
@@ -228,10 +237,13 @@ def cleanup_project(compose: list[str], env: dict[str, str], project: str, evide
     (evidence / "cleanup.log").write_text(result.stdout or "")
     if result.returncode:
         raise GateError(f"Compose cleanup failed ({result.returncode}); see {evidence / 'cleanup.log'}.")
+    for item in present_images:
+        run(["docker", "image", "rm", item], capture=True)
     leftovers = {
         "containers": run(compose + ["ps", "-aq"], env=env, capture=True).stdout.strip(),
         "volumes": run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip(),
         "networks": run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip(),
+        "images": [item for item in images if run(["docker", "image", "inspect", item], check=False, capture=True).returncode == 0],
     }
     if any(leftovers.values()):
         raise GateError(f"Project cleanup left resources behind: {leftovers}.")
@@ -252,11 +264,22 @@ def cleanup_temp_directory(temp: Path) -> None:
     temp.rmdir()
 
 
-def write_override(temp: Path, issuer: str) -> Path:
+def capability_images(project: str) -> list[str]:
+    return [f"finance-game-capability/{project}-{service}:local" for service in ("migrate", "api", "ui")]
+
+
+def write_override(temp: Path, issuer: str, project: str) -> Path:
+    migrate_image, api_image, ui_image = capability_images(project)
+    build_labels = {IMAGE_LABEL: project}
     override = {
         "services": {
+            "migrate": {
+                "image": migrate_image,
+                "build": {"labels": build_labels},
+            },
             "api": {
-                "build": {"target": "capability-api"},
+                "image": api_image,
+                "build": {"target": "capability-api", "labels": build_labels},
                 "environment": {
                     "OIDC_ISSUER": issuer,
                     "OIDC_AUDIENCE": "finance-game-capability",
@@ -265,6 +288,10 @@ def write_override(temp: Path, issuer: str) -> Path:
                 },
                 "volumes": [f"{temp / 'fixture' / 'tls.crt'}:/capability-ca.crt:ro"],
                 "depends_on": {"oidc-fixture": {"condition": "service_healthy"}},
+            },
+            "ui": {
+                "image": ui_image,
+                "build": {"labels": build_labels},
             },
             "oidc-fixture": {
                 "image": "python:3.13.7-alpine3.22",
@@ -338,7 +365,7 @@ def main() -> int:
         shutil.copy2(ROOT / "scripts" / "capability_oidc.py", fixture_dir / "capability_oidc.py")
         (fixture_dir / "jwks.json").write_text(json.dumps({"keys": [rsa_jwk((temp / "signing.pub.der").read_bytes())]}, separators=(",", ":")))
         issuer = "https://oidc:8443/"
-        override = write_override(temp, issuer)
+        override = write_override(temp, issuer, project)
         compose = compose_command(temp, override, project)
     except BaseException:
         cleanup_temp_directory(temp)
@@ -381,6 +408,10 @@ def main() -> int:
         networks = run(["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"], capture=True).stdout.strip()
         if networks:
             raise GateError(f"Generated project name unexpectedly already owns networks: {project}")
+        existing_images = set(run(["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"], capture=True).stdout.splitlines())
+        collisions = sorted(set(capability_images(project)) & existing_images)
+        if collisions:
+            raise GateError(f"Generated project name unexpectedly already owns capability images: {collisions}")
         created = True
         run(compose + ["up", "--build", "--detach", "--wait", "db"], env=env)
         # Deliberately wrong credentials prove failed migration is visible and recoverable.

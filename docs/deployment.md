@@ -47,9 +47,12 @@ supplies an empty Compose env file, and validates the resolved config before
 starting containers. Compose reports a bind error if another process already
 owns the selected port. Postgres and the API stay private. Its database volume is
 project-scoped. Cleanup checks Compose project labels and runs `down --volumes`
-only for this generated project. `--keep` on the underlying Python command
-leaves the stack running and retains the temporary OIDC fixture files for
-inspection; normal runs remove their project and fixture files.
+only for this generated project. The Go migration/API and UI images receive
+unique project-scoped tags and an ownership label; cleanup verifies that label
+before removing those tags. Shared base images are left in place. `--keep` on
+the underlying Python command leaves the stack running and retains the
+temporary OIDC fixture files for inspection; normal runs remove their project
+and fixture files.
 Evidence is written under `outputs/capability-gates/<project>/` with source
 revisions, artifact IDs and hashes, migration failure output, and bounded
 Compose logs. It never connects to or removes a pre-existing project or
