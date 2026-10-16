@@ -24,3 +24,11 @@ logs service="":
 # Check the resolved Compose configuration.
 config:
     docker compose config --quiet
+
+# Exercise a disposable UI/API/Postgres stack and fabricated 2026 household.
+# Requires explicit, clean local Go and UI source checkouts.
+capability-gate go_source ui_source:
+    python3 scripts/capability_gate.py --go-source "{{go_source}}" --ui-source "{{ui_source}}"
+
+test-capability-gate:
+    python3 -m unittest discover -s tests -v
