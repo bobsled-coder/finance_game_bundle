@@ -3,7 +3,7 @@
 `compose.yaml` builds from the immutable source pair recorded in
 [`release-pair.json`](../release-pair.json):
 
-- `finance_game_go` at `67fee691d19cbe30bd1e142f73fb177362522e0e`
+- `finance_game_go` at `58b79b94886713ce0912cfda01aa2943ec7483a1`
 - `finance_game_ui` at `649ddf704ab06a530471def66316fa60b44e8887`
 
 Docker BuildKit fetches the full Git SHA contexts during `just up`. The machine

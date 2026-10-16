@@ -1,6 +1,6 @@
 name: finance_game_bundle
 
-x-go-source-context: &go-source-context ${GO_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_go.git#67fee691d19cbe30bd1e142f73fb177362522e0e}
+x-go-source-context: &go-source-context ${GO_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_go.git#58b79b94886713ce0912cfda01aa2943ec7483a1}
 x-ui-source-context: &ui-source-context ${UI_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_ui.git#649ddf704ab06a530471def66316fa60b44e8887}
 x-release-labels: &release-labels
   org.financegame.release.id: ${RELEASE_ID:-finance-game-2026-10-candidate-1}
@@ -31,12 +31,12 @@ services:
       labels:
         <<: *release-labels
         org.financegame.source.role: migration
-        org.financegame.source.revision: ${GO_SOURCE_REVISION:-67fee691d19cbe30bd1e142f73fb177362522e0e}
+        org.financegame.source.revision: ${GO_SOURCE_REVISION:-58b79b94886713ce0912cfda01aa2943ec7483a1}
     labels:
       <<: *release-labels
       org.financegame.source.role: migration
       org.financegame.source.repository: https://github.com/bobsled-coder/finance_game_go.git
-      org.financegame.source.revision: ${GO_SOURCE_REVISION:-67fee691d19cbe30bd1e142f73fb177362522e0e}
+      org.financegame.source.revision: ${GO_SOURCE_REVISION:-58b79b94886713ce0912cfda01aa2943ec7483a1}
     environment: &postgres_client_env
       PGHOST: db
       PGPORT: "5432"
@@ -56,7 +56,7 @@ services:
       labels:
         <<: *release-labels
         org.financegame.source.role: api
-        org.financegame.source.revision: ${GO_SOURCE_REVISION:-67fee691d19cbe30bd1e142f73fb177362522e0e}
+        org.financegame.source.revision: ${GO_SOURCE_REVISION:-58b79b94886713ce0912cfda01aa2943ec7483a1}
     environment:
       <<: *postgres_client_env
       HTTP_ADDR: ":8080"
@@ -68,7 +68,7 @@ services:
       <<: *release-labels
       org.financegame.source.role: api
       org.financegame.source.repository: https://github.com/bobsled-coder/finance_game_go.git
-      org.financegame.source.revision: ${GO_SOURCE_REVISION:-67fee691d19cbe30bd1e142f73fb177362522e0e}
+      org.financegame.source.revision: ${GO_SOURCE_REVISION:-58b79b94886713ce0912cfda01aa2943ec7483a1}
     restart: unless-stopped
 
   ui:
