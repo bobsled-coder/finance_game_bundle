@@ -473,7 +473,7 @@ def main() -> int:
         compilation_hash = compiled.get("contentHash", compiled.get("compilation", {}).get("contentHash"))
         if not compilation_version or not compilation_hash:
             raise GateError(f"Compilation response missing version/content hash: {compiled}")
-        missing_pack = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs", token, body={"rulePackVersion": "capability-fixture-pack-does-not-exist"}, expected=404)
+        missing_pack = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/compiled-inputs", token, body={"rulePackVersion": "canadian-planning-rules-v99"}, expected=404)
         missing_code = missing_pack.get("error", {}).get("code")
         if missing_code != "rule_pack_not_found":
             raise GateError(f"Missing pack response should be actionable rule_pack_not_found, received: {missing_pack}")
