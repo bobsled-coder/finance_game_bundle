@@ -1,0 +1,252 @@
+[
+  {
+    "case": "empty runtime rule catalog",
+    "method": "GET",
+    "path": "/api/v1/reference/canadian-rule-packs",
+    "status": 200,
+    "response": {
+      "rulePacks": []
+    },
+    "elapsed_ms": 11.936
+  },
+  {
+    "case": "invalid Person date",
+    "method": "POST",
+    "path": "/api/v1/people",
+    "status": 422,
+    "response": {
+      "error": {
+        "code": "invalid_person",
+        "message": "Person values are invalid.",
+        "fields": {
+          "birthDate": "Use YYYY-MM or a real calendar date in YYYY-MM-DD format."
+        }
+      }
+    },
+    "elapsed_ms": 1.405
+  },
+  {
+    "case": "create fabricated Person",
+    "method": "POST",
+    "path": "/api/v1/people",
+    "status": 201,
+    "response": {
+      "id": "39481b5d-94fd-44a5-a251-8bfcd2d19808",
+      "name": "Fabricated Review Adult",
+      "birthDate": "1970-01-01",
+      "region": "ON",
+      "preferredCurrency": "CAD",
+      "notes": ""
+    },
+    "elapsed_ms": 4.31
+  },
+  {
+    "case": "create household",
+    "method": "POST",
+    "path": "/api/v1/households",
+    "status": 201,
+    "response": {
+      "id": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+      "name": "Fabricated Review Plan",
+      "notes": "",
+      "members": [
+        {
+          "personId": "39481b5d-94fd-44a5-a251-8bfcd2d19808",
+          "name": "Fabricated Review Adult"
+        }
+      ]
+    },
+    "elapsed_ms": 5.7
+  },
+  {
+    "case": "create settlement Account",
+    "method": "POST",
+    "path": "/api/v1/accounts",
+    "status": 201,
+    "response": {
+      "id": "2da75780-0987-4627-87e0-a3f3b20f094b",
+      "householdId": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+      "displayName": "Fabricated Chequing",
+      "accountType": "Chequing",
+      "defaultCurrency": "CAD",
+      "institution": null,
+      "jurisdiction": null,
+      "notes": "",
+      "ownerships": [
+        {
+          "personId": "39481b5d-94fd-44a5-a251-8bfcd2d19808",
+          "share": "1",
+          "effectiveStart": null,
+          "effectiveEnd": null
+        }
+      ]
+    },
+    "elapsed_ms": 20.979
+  },
+  {
+    "case": "exact balance",
+    "method": "POST",
+    "path": "/api/v1/accounts/2da75780-0987-4627-87e0-a3f3b20f094b/balances",
+    "status": 201,
+    "response": {
+      "accountId": "2da75780-0987-4627-87e0-a3f3b20f094b",
+      "effectiveDate": "2026-01-01",
+      "revision": 1,
+      "amount": "100000.10",
+      "sourceKind": "user_reported",
+      "sourceLabel": null,
+      "recordedAt": "2026-10-02T11:39:59.204961Z"
+    },
+    "elapsed_ms": 4.388
+  },
+  {
+    "case": "create selected Snapshot",
+    "method": "POST",
+    "path": "/api/v1/households/b6a58f62-4e1c-43c7-a4fb-54f127929fa2/snapshots",
+    "status": 201,
+    "response": {
+      "draft": {
+        "id": "4bebf213-e3a2-477e-a0ea-2479f12660b2",
+        "householdId": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+        "name": "Fabricated Baseline",
+        "asOfDate": "2026-01-01",
+        "status": "draft",
+        "version": 1,
+        "notes": "",
+        "createdAt": "2026-10-02T11:39:59.209114Z",
+        "updatedAt": "2026-10-02T11:39:59.209114Z"
+      },
+      "included": [
+        {
+          "kind": "account_balance",
+          "recordId": "2da75780-0987-4627-87e0-a3f3b20f094b",
+          "effectiveDate": "2026-01-01",
+          "revision": 1,
+          "snapshotId": "4bebf213-e3a2-477e-a0ea-2479f12660b2",
+          "householdId": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+          "displayName": "Fabricated Chequing",
+          "amount": "100000.10",
+          "sourceKind": "user_reported",
+          "sourceLabel": null,
+          "recordedAt": "2026-10-02T11:39:59.204961Z"
+        }
+      ],
+      "missing": []
+    },
+    "elapsed_ms": 12.757
+  },
+  {
+    "case": "finalize Snapshot",
+    "method": "POST",
+    "path": "/api/v1/households/b6a58f62-4e1c-43c7-a4fb-54f127929fa2/snapshots/4bebf213-e3a2-477e-a0ea-2479f12660b2/finalize",
+    "status": 200,
+    "response": {
+      "draft": {
+        "id": "4bebf213-e3a2-477e-a0ea-2479f12660b2",
+        "householdId": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+        "name": "Fabricated Baseline",
+        "asOfDate": "2026-01-01",
+        "status": "finalized",
+        "version": 2,
+        "notes": "",
+        "createdAt": "2026-10-02T11:39:59.209114Z",
+        "updatedAt": "2026-10-02T11:39:59.22192Z"
+      },
+      "included": [],
+      "missing": [],
+      "finalized": {
+        "contentHash": "cdf6384cb24117cf1435382a113d4343fd4e548aaaa184e663bdd7f00602eb88",
+        "content": {
+          "schemaVersion": 1,
+          "householdId": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+          "asOfDate": "2026-01-01",
+          "accounts": [
+            {
+              "id": "2da75780-0987-4627-87e0-a3f3b20f094b",
+              "displayName": "Fabricated Chequing",
+              "accountType": "Chequing",
+              "defaultCurrency": "CAD",
+              "institution": null,
+              "jurisdiction": null,
+              "balance": {
+                "effectiveDate": "2026-01-01",
+                "revision": 1,
+                "amountCents": 10000010,
+                "sourceKind": "user_reported",
+                "sourceLabel": null,
+                "recordedAt": "2026-10-02T11:39:59.204961Z"
+              },
+              "owners": [
+                {
+                  "personId": "39481b5d-94fd-44a5-a251-8bfcd2d19808",
+                  "share": "1"
+                }
+              ]
+            }
+          ],
+          "assets": [],
+          "liabilities": []
+        },
+        "finalizedAt": "2026-10-02T11:39:59.22192Z"
+      }
+    },
+    "elapsed_ms": 10.688
+  },
+  {
+    "case": "reject finalized Snapshot edit",
+    "method": "PUT",
+    "path": "/api/v1/households/b6a58f62-4e1c-43c7-a4fb-54f127929fa2/snapshots/4bebf213-e3a2-477e-a0ea-2479f12660b2/selections",
+    "status": 409,
+    "response": {
+      "error": {
+        "code": "stale_snapshot_version",
+        "message": "Expected Snapshot version does not match the current version."
+      }
+    },
+    "elapsed_ms": 1.725
+  },
+  {
+    "case": "create retirement horizon Scenario",
+    "method": "POST",
+    "path": "/api/v1/households/b6a58f62-4e1c-43c7-a4fb-54f127929fa2/scenarios",
+    "status": 201,
+    "response": {
+      "id": "dbc3e504-6ed8-4d6e-bfc3-dd9162107cb1",
+      "householdId": "b6a58f62-4e1c-43c7-a4fb-54f127929fa2",
+      "name": "Fabricated age 56 to 96",
+      "baselineSnapshotId": "4bebf213-e3a2-477e-a0ea-2479f12660b2",
+      "baselineSnapshotVersion": 2,
+      "baselineContentHash": "cdf6384cb24117cf1435382a113d4343fd4e548aaaa184e663bdd7f00602eb88",
+      "startDate": "2026-01-01",
+      "endDate": "2065-12-31",
+      "annualInflationRate": "0.02",
+      "annualNominalReturnRate": "0.04",
+      "growthOverrides": [],
+      "createdAt": "2026-10-02T11:39:59.234757Z"
+    },
+    "elapsed_ms": 2.94
+  },
+  {
+    "case": "compile against missing production pack",
+    "method": "POST",
+    "path": "/api/v1/households/b6a58f62-4e1c-43c7-a4fb-54f127929fa2/scenarios/dbc3e504-6ed8-4d6e-bfc3-dd9162107cb1/compiled-inputs",
+    "status": 404,
+    "response": {
+      "error": {
+        "code": "rule_pack_not_found",
+        "message": "The requested Canadian rule pack is not available."
+      }
+    },
+    "elapsed_ms": 4.435
+  },
+  {
+    "case": "200 Snapshot-list requests / 20 threads",
+    "statuses": {
+      "200": 200
+    },
+    "p50_ms": 7.831,
+    "p95_ms": 16.229,
+    "max_ms": 19.928,
+    "scope": "one local fabricated Household, empty surrounding dataset; diagnostic only"
+  }
+]

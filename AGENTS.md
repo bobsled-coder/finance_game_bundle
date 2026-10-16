@@ -4,9 +4,13 @@
 
 Use the [finance_game_bundle Linear project](https://linear.app/boblsed-coder/project/finance-game-bundle-58e2acfeb4fa)
 for issues and acceptance criteria. Use an issue's exact `gitBranchName` for its
-branch and include its `BOB-` identifier in commits and Linear updates. This
-solo workflow uses direct integration: after implementation and validation,
-merge to `main` and push `main`; do not create pull requests. See
+branch and include its exact Linear identifier in commits and Linear updates.
+Before implementation, have the architect plan the scope, design, sequence, and
+validation. After implementation and required checks, have the reviewer inspect
+the complete change before committing. Resolve blocking findings and get a
+follow-up review after material changes. This solo workflow uses direct
+integration: after review and validation, merge to `main` and push `main`; do
+not create pull requests. See
 `docs/agents/issue-tracker.md`.
 
 ## Repository scope

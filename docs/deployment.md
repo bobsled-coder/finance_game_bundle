@@ -1,5 +1,12 @@
 # Deployment
 
+The [2 October 2026 readiness review](product-readiness-review.md) and its
+[workflow evidence](workflow-validation.md) are historical snapshots. They
+predate the SLED-86 capability gate and SLED-88 recovery rehearsal; their
+observations about release qualification or rule-pack availability should not
+be read as current deployment status. This document and the committed release
+evidence below describe the current bundle contract.
+
 `compose.yaml` builds from the immutable source pair recorded in
 [`release-pair.json`](../release-pair.json):
 

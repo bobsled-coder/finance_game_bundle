@@ -41,3 +41,12 @@ to verify restore compatibility and immutable artifact hashes.
 Work for this bundle is tracked in the
 [finance_game_bundle Linear project](https://linear.app/boblsed-coder/project/finance-game-bundle-58e2acfeb4fa).
 The GitHub repository is `git@github.com:bobsled-coder/finance_game_bundle.git`.
+
+## Readiness review archive
+
+The [2 October 2026 readiness review](docs/product-readiness-review.md),
+[architecture snapshot](docs/architecture.md), and
+[workflow evidence](docs/workflow-validation.md) preserve the findings that
+shaped the deployment and recovery work. They are historical snapshots. Some
+reported gaps were closed later; use the current deployment instructions and
+Linear issue status to determine what is supported today.

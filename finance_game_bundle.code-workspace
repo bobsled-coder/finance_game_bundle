@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../finance_game_go"
+		},
+		{
+			"path": "../finance_game_ui"
+		}
+	],
+	"settings": {}
+}
