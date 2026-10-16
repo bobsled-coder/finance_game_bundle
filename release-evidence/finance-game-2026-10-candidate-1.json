@@ -1,0 +1,86 @@
+{
+  "status": "runtime-qualified",
+  "releaseId": "finance-game-2026-10-candidate-1",
+  "releasePairSha256": "6085b6022acdec4ca207ee81097e63123e6e161315ea5686fb1ee12828308658",
+  "sources": {
+    "go": "58b79b94886713ce0912cfda01aa2943ec7483a1",
+    "ui": "649ddf704ab06a530471def66316fa60b44e8887"
+  },
+  "compatibility": {
+    "databaseSchemaVersion": 27,
+    "rulePackVersion": "canadian-planning-rules-test-v1",
+    "capabilityFixture": {
+      "compiledInputSchemaVersion": 1,
+      "compilerVersion": "scenario-compiler-v1",
+      "timelineCalculationVersion": "projection-monthly-timeline-v1",
+      "reportSchemaVersion": "scenario-run-report-v5",
+      "reportCalculationVersion": "scenario-run-report-builder-v5",
+      "readinessSchemaVersion": "scenario-run-readiness-v1",
+      "readinessCalculationVersion": "scenario-run-readiness-builder-v1",
+      "runArtifactVersion": "scenario-run-result-v7"
+    }
+  },
+  "observedCompatibility": {
+    "rulePackVersion": "canadian-planning-rules-test-v1",
+    "compiledInputSchemaVersion": 1,
+    "compilerVersion": "scenario-compiler-v1",
+    "timelineCalculationVersion": "projection-monthly-timeline-v1",
+    "runArtifactVersion": "scenario-run-result-v7",
+    "reportSchemaVersion": "scenario-run-report-v5",
+    "reportCalculationVersion": "scenario-run-report-builder-v5",
+    "readinessSchemaVersion": "scenario-run-readiness-v1",
+    "readinessCalculationVersion": "scenario-run-readiness-builder-v1"
+  },
+  "databaseSchemaVersion": 27,
+  "deployedImages": {
+    "migrate": {
+      "containerId": "ef0a28485e09a8bf71b75250274312459bb4739f2b4fca5cc40f483016b38e8b",
+      "imageId": "sha256:fe4849774ef8a5fa630fd0da829760a9086e37ff608b95082b6722e7b5b51d58",
+      "sourceRevision": "58b79b94886713ce0912cfda01aa2943ec7483a1",
+      "labels": {
+        "org.financegame.release.id": "finance-game-2026-10-candidate-1",
+        "org.financegame.release.pair-sha256": "6085b6022acdec4ca207ee81097e63123e6e161315ea5686fb1ee12828308658",
+        "org.financegame.release.qualification": "candidate",
+        "org.financegame.source.revision": "58b79b94886713ce0912cfda01aa2943ec7483a1"
+      }
+    },
+    "api": {
+      "containerId": "f72b1a181a521be7f79658651437c18f3f6ef29d914afa49e9a6d8b0893f9258",
+      "imageId": "sha256:7bca13d055645e0179494ab43b45484175d82a16fde465fb58954ed270cbd73b",
+      "sourceRevision": "58b79b94886713ce0912cfda01aa2943ec7483a1",
+      "labels": {
+        "org.financegame.release.id": "finance-game-2026-10-candidate-1",
+        "org.financegame.release.pair-sha256": "6085b6022acdec4ca207ee81097e63123e6e161315ea5686fb1ee12828308658",
+        "org.financegame.release.qualification": "candidate",
+        "org.financegame.source.revision": "58b79b94886713ce0912cfda01aa2943ec7483a1"
+      }
+    },
+    "ui": {
+      "containerId": "83b88c4d5b4cb198e45eb801283977381d70fcca593116b7f2ab481d5eae4b5c",
+      "imageId": "sha256:1a65a423d37c7aa892d5c2312d08cc07acd71bc714ac8e38d3e6745041fa420d",
+      "sourceRevision": "649ddf704ab06a530471def66316fa60b44e8887",
+      "labels": {
+        "org.financegame.release.id": "finance-game-2026-10-candidate-1",
+        "org.financegame.release.pair-sha256": "6085b6022acdec4ca207ee81097e63123e6e161315ea5686fb1ee12828308658",
+        "org.financegame.release.qualification": "candidate",
+        "org.financegame.source.revision": "649ddf704ab06a530471def66316fa60b44e8887"
+      }
+    }
+  },
+  "bundleRevision": "6854a18164510283a37b5667cdb7a8469ef56915",
+  "completedPhases": [
+    "fresh-build",
+    "migration-connection-failure",
+    "fresh-build",
+    "deployed-source-pair",
+    "spa-and-deep-links",
+    "api-proxy-and-rule-catalog",
+    "fabricated-household-compile-run-reopen-compare",
+    "migration-version-failure-recovery",
+    "api-offline-and-recovery",
+    "complete"
+  ],
+  "evidenceDirectory": "/tmp/finance_game_bundle_sled87_direct_main/outputs/capability-gates/fgcap-b0aa99e2245b",
+  "completedAt": 1792121303,
+  "cleanup": "removed"
+}

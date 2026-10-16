@@ -11,15 +11,13 @@ running Compose needs Docker Compose, `just`, and SSH access to both
 repositories. `just release-check` resolves Compose without starting services
 and reports the source and compatibility identity.
 
-This pair is a **candidate**, not a runtime-qualified release. The disposable
-capability gate has not completed successfully for this exact pair. Its
-compatibility record names database schema 26, the selected rule pack, and the
-exact compiled-input, timeline, report, readiness, and Run artifact versions
-expected from the fabricated journey. A successful gate writes a
-`qualification.json` receipt containing the pair hash, observed versions,
-source revisions, bundle revision, image IDs, and completed phases. Only a
-receipt that binds this exact pair may be referenced when the manifest's
-`qualification.status` is changed to `qualified`.
+This pair passed the disposable no-cache capability gate. Its compatibility
+record names database schema 27, the test-only rule pack, and the exact
+compiled-input, timeline, report, readiness, and Run artifact versions observed
+in the fabricated journey. The committed receipt at
+[`release-evidence/finance-game-2026-10-candidate-1.json`](../release-evidence/finance-game-2026-10-candidate-1.json)
+records the pair hash, observed versions, source revisions, bundle revision,
+image IDs, and completed phases.
 
 Startup reports both source revisions, qualification state, database schema,
 rule pack, and compiler contract before migration starts. API and migration

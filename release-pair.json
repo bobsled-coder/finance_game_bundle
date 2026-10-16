@@ -2,9 +2,9 @@
   "formatVersion": 1,
   "releaseId": "finance-game-2026-10-candidate-1",
   "qualification": {
-    "status": "candidate",
-    "evidence": null,
-    "note": "Runtime qualification is pending a successful disposable capability gate on a Docker-capable host."
+    "status": "qualified",
+    "evidence": "release-evidence/finance-game-2026-10-candidate-1.json",
+    "note": "Exact pinned pair passed the disposable no-cache capability gate."
   },
   "sources": {
     "go": {
