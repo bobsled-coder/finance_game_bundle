@@ -598,13 +598,9 @@ def main() -> int:
         comparison_id = comparison.get("comparisonId")
         if not comparison_id:
             raise GateError(f"Comparison response missing immutable comparison ID: {comparison}")
-        comparison_history = request_json(base, f"/api/v1/households/{household_id}/comparisons", token)
-        comparison_history_ids = [item.get("comparisonId") for item in comparison_history.get("comparisons", [])]
-        if comparison_id not in comparison_history_ids:
-            raise GateError(f"Household comparison history did not include saved comparison {comparison_id}: {comparison_history}")
-        reopened_comparison = request_json(base, f"/api/v1/households/{household_id}/comparisons/{comparison_id}", token)
-        if reopened_comparison.get("comparisonId") != comparison_id:
-            raise GateError("Reopened comparison ID does not match the saved immutable comparison.")
+        reopened_comparison = request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/comparisons/{comparison_id}", token)
+        if reopened_comparison.get("id") != comparison_id:
+            raise GateError("Reopened scenario comparison ID does not match the saved immutable comparison.")
         comparison_alternative = comparison.get("alternativeScenario", {}).get("id")
         if not comparison_alternative:
             raise GateError(f"Comparison response missing alternative Scenario: {comparison}")
@@ -677,7 +673,7 @@ def main() -> int:
         if observed_report != expected_report:
             raise GateError(f"Run report compatibility mismatch: expected {expected_report}, received {observed_report}.")
         manifest["observedCompatibility"] = {"rulePackVersion": rule_pack, **observed_compiler, **observed_run, **observed_report}
-        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "secondRunId": second_run_id, "historyGoalId": goal.get("id"), "householdRunHistoryPageIds": household_history_ids, "householdRunHistoryPageCount": household_history_page_count, "scenarioRunHistoryIds": sorted(scenario_history_ids), "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonId": comparison_id, "comparisonHistoryContainsSavedId": comparison_id in comparison_history_ids, "comparisonDeltas": deltas, "missingPackError": missing_code}
+        manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "secondRunId": second_run_id, "historyGoalId": goal.get("id"), "householdRunHistoryPageIds": household_history_ids, "householdRunHistoryPageCount": household_history_page_count, "scenarioRunHistoryIds": sorted(scenario_history_ids), "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonId": comparison_id, "comparisonReopened": reopened_comparison.get("id") == comparison_id, "comparisonDeltas": deltas, "missingPackError": missing_code}
         phase("fabricated-household-compile-run-reopen-compare", "passed", artifacts=manifest["artifacts"])
 
         # A future schema marker must fail closed and be recoverable by removing only that marker.
