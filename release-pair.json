@@ -9,7 +9,7 @@
   "sources": {
     "go": {
       "repository": "ssh://git@github.com/bobsled-coder/finance_game_go.git",
-      "revision": "805c19f0acb52eedf686767971a1414232233980"
+      "revision": "67fee691d19cbe30bd1e142f73fb177362522e0e"
     },
     "ui": {
       "repository": "ssh://git@github.com/bobsled-coder/finance_game_ui.git",
