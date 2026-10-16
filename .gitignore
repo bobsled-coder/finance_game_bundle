@@ -3,3 +3,4 @@
 .release-deployments/
 outputs/capability-gates/
 scripts/__pycache__/
+tests/__pycache__/
