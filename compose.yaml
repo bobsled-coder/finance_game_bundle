@@ -1,5 +1,12 @@
 name: finance_game_bundle
 
+x-go-source-context: &go-source-context ${GO_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_go.git#805c19f0acb52eedf686767971a1414232233980}
+x-ui-source-context: &ui-source-context ${UI_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_ui.git#649ddf704ab06a530471def66316fa60b44e8887}
+x-release-labels: &release-labels
+  org.financegame.release.id: ${RELEASE_ID:-finance-game-2026-10-candidate-1}
+  org.financegame.release.pair-sha256: ${RELEASE_PAIR_SHA256:-unresolved}
+  org.financegame.release.qualification: ${RELEASE_QUALIFICATION:-candidate}
+
 services:
   db:
     image: postgres:18.6-alpine
@@ -19,8 +26,17 @@ services:
 
   migrate:
     build:
-      context: ${GO_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_go.git#main}
+      context: *go-source-context
       target: migrate
+      labels:
+        <<: *release-labels
+        org.financegame.source.role: migration
+        org.financegame.source.revision: ${GO_SOURCE_REVISION:-805c19f0acb52eedf686767971a1414232233980}
+    labels:
+      <<: *release-labels
+      org.financegame.source.role: migration
+      org.financegame.source.repository: https://github.com/bobsled-coder/finance_game_go.git
+      org.financegame.source.revision: ${GO_SOURCE_REVISION:-805c19f0acb52eedf686767971a1414232233980}
     environment: &postgres_client_env
       PGHOST: db
       PGPORT: "5432"
@@ -35,8 +51,12 @@ services:
 
   api:
     build:
-      context: ${GO_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_go.git#main}
+      context: *go-source-context
       target: api
+      labels:
+        <<: *release-labels
+        org.financegame.source.role: api
+        org.financegame.source.revision: ${GO_SOURCE_REVISION:-805c19f0acb52eedf686767971a1414232233980}
     environment:
       <<: *postgres_client_env
       HTTP_ADDR: ":8080"
@@ -44,11 +64,20 @@ services:
       migrate:
         condition: service_completed_successfully
     networks: [backend]
+    labels:
+      <<: *release-labels
+      org.financegame.source.role: api
+      org.financegame.source.repository: https://github.com/bobsled-coder/finance_game_go.git
+      org.financegame.source.revision: ${GO_SOURCE_REVISION:-805c19f0acb52eedf686767971a1414232233980}
     restart: unless-stopped
 
   ui:
     build:
-      context: ${UI_SOURCE:-ssh://git@github.com/bobsled-coder/finance_game_ui.git#main}
+      context: *ui-source-context
+      labels:
+        <<: *release-labels
+        org.financegame.source.role: ui
+        org.financegame.source.revision: ${UI_SOURCE_REVISION:-649ddf704ab06a530471def66316fa60b44e8887}
     depends_on:
       api:
         condition: service_started
@@ -61,6 +90,11 @@ services:
       timeout: 3s
       retries: 12
     networks: [backend]
+    labels:
+      <<: *release-labels
+      org.financegame.source.role: ui
+      org.financegame.source.repository: https://github.com/bobsled-coder/finance_game_ui.git
+      org.financegame.source.revision: ${UI_SOURCE_REVISION:-649ddf704ab06a530471def66316fa60b44e8887}
     restart: unless-stopped
 
 networks:

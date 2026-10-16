@@ -17,10 +17,22 @@ class InspectConfigTests(unittest.TestCase):
             "networks": {"backend": {"name": network_name}},
             "services": {
                 "db": {"volumes": [], "ports": []},
-                "api": {"volumes": [], "ports": []},
+                "migrate": {
+                    "volumes": [],
+                    "ports": [],
+                    "build": {"context": "/tmp/go"},
+                    "labels": {"org.financegame.source.revision": "a" * 40},
+                },
+                "api": {
+                    "volumes": [],
+                    "ports": [],
+                    "build": {"context": "/tmp/go"},
+                    "labels": {"org.financegame.source.revision": "a" * 40},
+                },
                 "ui": {
                     "volumes": [],
                     "ports": [{"host_ip": "127.0.0.1", "target": 8080}],
+                    "labels": {"org.financegame.source.revision": "b" * 40},
                 },
             },
         }
@@ -28,6 +40,8 @@ class InspectConfigTests(unittest.TestCase):
         env = {
             "CAPABILITY_PROJECT": project,
             "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-test",
+            "GO_SOURCE_REVISION": "a" * 40,
+            "UI_SOURCE_REVISION": "b" * 40,
         }
         with patch.object(capability_gate, "run", return_value=result):
             capability_gate.inspect_config(["docker", "compose"], env)

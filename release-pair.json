@@ -1,0 +1,33 @@
+{
+  "formatVersion": 1,
+  "releaseId": "finance-game-2026-10-candidate-1",
+  "qualification": {
+    "status": "candidate",
+    "evidence": null,
+    "note": "Runtime qualification is pending a successful disposable capability gate on a Docker-capable host."
+  },
+  "sources": {
+    "go": {
+      "repository": "ssh://git@github.com/bobsled-coder/finance_game_go.git",
+      "revision": "805c19f0acb52eedf686767971a1414232233980"
+    },
+    "ui": {
+      "repository": "ssh://git@github.com/bobsled-coder/finance_game_ui.git",
+      "revision": "649ddf704ab06a530471def66316fa60b44e8887"
+    }
+  },
+  "compatibility": {
+    "databaseSchemaVersion": 27,
+    "rulePackVersion": "canadian-planning-rules-test-v1",
+    "capabilityFixture": {
+      "compiledInputSchemaVersion": 1,
+      "compilerVersion": "scenario-compiler-v1",
+      "timelineCalculationVersion": "projection-monthly-timeline-v1",
+      "reportSchemaVersion": "scenario-run-report-v5",
+      "reportCalculationVersion": "scenario-run-report-builder-v5",
+      "readinessSchemaVersion": "scenario-run-readiness-v1",
+      "readinessCalculationVersion": "scenario-run-readiness-builder-v1",
+      "runArtifactVersion": "scenario-run-result-v7"
+    }
+  }
+}

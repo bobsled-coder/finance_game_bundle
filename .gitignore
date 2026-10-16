@@ -1,4 +1,5 @@
 .env
 .serena/
+.release-deployments/
 outputs/capability-gates/
 scripts/__pycache__/

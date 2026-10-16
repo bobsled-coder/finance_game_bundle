@@ -14,14 +14,17 @@ read both source repositories, then run from this directory:
 just up
 ```
 
-Open <http://127.0.0.1:3000>. Compose builds the `main` branch of both source
-repositories, starts Postgres, applies the Go SQL migrations, then starts the
-API and UI. It waits until both the UI and API are healthy. It does not copy
-either source repository into this package.
+Open <http://127.0.0.1:3000>. Compose builds the immutable UI/API source pair in
+[`release-pair.json`](release-pair.json), starts Postgres, applies the Go SQL
+migrations, then starts the API and UI. The pair is currently a candidate; it
+is not runtime-qualified until the disposable capability gate passes. Run
+`just release-check` to print and validate the pinned source and compatibility
+identity before startup. The bundle does not copy either source repository.
 
 To use local sibling checkouts or change the port, bind address, or database
-password, copy `.env.example` to `.env` and edit it before launch. The Compose
-file defaults to authenticated SSH Git contexts for both source repositories.
+password, copy `.env.example` to `.env` and edit it before launch. `just up`
+records actual local checkout revisions as a development override. The pinned
+defaults use authenticated SSH Git contexts.
 
 ```sh
 just logs
