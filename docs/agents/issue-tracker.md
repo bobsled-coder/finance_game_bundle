@@ -11,5 +11,6 @@ criteria.
 
 Track Compose packaging and deployment work here. Keep feature implementation
 in the UI or Go source projects and link related issues when needed. Use the
-issue's exact `gitBranchName` for branches. Put the Linear identifier in each
-PR title.
+issue's exact `gitBranchName` for branches. Put the Linear identifier in commits
+and Linear updates. After required checks pass, merge directly to `main` and
+push it; do not create pull requests for this solo workflow.

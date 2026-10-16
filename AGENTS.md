@@ -4,7 +4,9 @@
 
 Use the [finance_game_bundle Linear project](https://linear.app/boblsed-coder/project/finance-game-bundle-58e2acfeb4fa)
 for issues and acceptance criteria. Use an issue's exact `gitBranchName` for its
-branch and include its `BOB-` identifier in the PR title. See
+branch and include its `BOB-` identifier in commits and Linear updates. This
+solo workflow uses direct integration: after implementation and validation,
+merge to `main` and push `main`; do not create pull requests. See
 `docs/agents/issue-tracker.md`.
 
 ## Repository scope
