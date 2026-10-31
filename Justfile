@@ -34,6 +34,10 @@ config:
 capability-gate go_source ui_source:
     python3 scripts/capability_gate.py --go-source "{{go_source}}" --ui-source "{{ui_source}}" --no-cache
 
+# Run the non-qualifying real-browser borrowing candidate gate against exact committed Go/UI revisions.
+capability-gate-borrowing go_source ui_source candidate_manifest:
+    python3 scripts/capability_gate.py --go-source "{{go_source}}" --ui-source "{{ui_source}}" --candidate-manifest "{{candidate_manifest}}" --borrowing-browser --no-cache
+
 test-capability-gate:
     python3 -m unittest discover -s tests -v
 

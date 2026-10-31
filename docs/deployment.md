@@ -273,6 +273,55 @@ revisions, artifact IDs and hashes, migration failure output, and bounded
 Compose logs. It never connects to or removes a pre-existing project or
 volume.
 
+The normal capability gate remains pinned to `release-pair.json` and is the
+only command that can write a runtime qualification receipt. To validate a
+candidate source pair without changing or qualifying that release, use the
+opt-in borrowing browser gate with a separate manifest containing exact
+committed source revisions:
+
+```json
+{
+  "formatVersion": 1,
+  "goRevision": "<40-character Go commit SHA>",
+  "uiRevision": "<40-character UI commit SHA>"
+}
+```
+
+Run `just capability-gate-borrowing <go-checkout> <ui-checkout>
+<candidate-manifest>`. This candidate mode requires a clean bundle checkout,
+builds the committed source pair without cache, and labels the deployed images
+`candidate-validation`. It records the unchanged qualified pair separately and
+never writes `qualification.json` or changes `release-pair.json`.
+
+The browser runner runs on the host. Install Node.js/npm, then install the UI's
+locked dependencies and Playwright Chromium before starting the gate:
+
+```sh
+cd <ui-checkout>
+npm ci
+npx playwright install chromium
+```
+
+If using a system Chromium instead, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to its executable path when invoking the
+gate. Candidate mode checks the local Playwright CLI and executable browser
+before it builds the disposable Docker stack, and records both in its manifest.
+
+After the existing authenticated API smoke, the browser phase seeds a
+fabricated long-horizon Snapshot through the real API, switches only the
+disposable API container to local single-owner authentication, and runs two
+Playwright browser contexts against the published UI port without bearer
+credentials or route mocks. The first authors and runs a long-horizon borrowing
+Scenario through visible controls. The second reopens a saved stress suite after
+the gate prepares a valid peer and an unfundable registered contribution.
+Browser traces, screenshots, per-phase Playwright outputs, logs, fixture IDs,
+Run/suite IDs, and exact source revisions are retained in separate
+`browser-artifacts/scenario/` and `browser-artifacts/suite/` directories so the
+suite run cannot replace Scenario artifacts. The API returns to the
+original OIDC configuration before the existing migration-failure and recovery
+checks continue. Candidate mode does not run the separate backup recovery
+rehearsal.
+
 The fixture creates a fabricated Person, Household, Chequing Account, exact
 `100000.10` CAD balance, finalized 2026 Snapshot, Scenario, compilation, Run,
 and unchanged comparison through the UI's published port and `/api/v1` proxy.

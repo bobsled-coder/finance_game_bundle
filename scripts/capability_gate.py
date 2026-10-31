@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -35,6 +36,7 @@ RULE_PACK = "canadian-planning-rules-test-v1"
 TIMEOUT = 90
 IMAGE_LABEL = "io.bobsled.capability-project"
 DISPOSABLE_PROJECT = re.compile(r"^fgcap-[0-9a-f]{12}$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 class GateError(RuntimeError):
@@ -46,6 +48,29 @@ def load_release_pair() -> tuple[dict, str]:
         return release_pair.load()
     except release_pair.ReleasePairError as error:
         raise GateError(str(error)) from error
+
+
+def load_candidate_manifest(path: Path) -> tuple[dict[str, object], str]:
+    try:
+        raw = path.expanduser().resolve().read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateError(f"Cannot read candidate source manifest {path}: {error}") from error
+    if not isinstance(value, dict) or value.get("formatVersion") != 1:
+        raise GateError("Candidate source manifest must be a JSON object with formatVersion 1.")
+    if set(value) != {"formatVersion", "goRevision", "uiRevision"}:
+        raise GateError("Candidate source manifest must contain exactly formatVersion, goRevision, and uiRevision.")
+    for key in ("goRevision", "uiRevision"):
+        if not isinstance(value[key], str) or not COMMIT.fullmatch(value[key]):
+            raise GateError(f"Candidate source manifest {key} must be a full lowercase Git SHA.")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def validate_candidate_revisions(candidate: dict[str, object], go_revision: str, ui_revision: str) -> None:
+    for name, actual in (("goRevision", go_revision), ("uiRevision", ui_revision)):
+        expected = candidate[name]
+        if actual != expected:
+            raise GateError(f"Candidate {name} mismatch: manifest requires {expected}, received {actual}.")
 
 
 def b64url(value: bytes) -> str:
@@ -117,6 +142,77 @@ def run_compose_build(compose: list[str], env: dict[str, str], evidence: Path) -
         )
 
 
+def run_capability_browser(ui_path: Path, base_url: str, fixture_manifest: Path, evidence: Path, *, grep: str) -> None:
+    if not (ui_path / "playwright.capability.config.ts").is_file():
+        raise GateError(f"UI source is missing playwright.capability.config.ts: {ui_path}")
+    if not fixture_manifest.is_file():
+        raise GateError(f"Browser fixture manifest is missing: {fixture_manifest}")
+    phase_name = re.sub(r"[^a-z0-9]+", "-", grep.lower()).strip("-")
+    output = evidence / "browser-artifacts" / phase_name
+    output.mkdir(parents=True, exist_ok=True)
+    env = {key: value for key, value in os.environ.items() if not key.upper().endswith("TOKEN") and key.upper() not in ("AUTHORIZATION", "OIDC_ENABLED", "OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URL") and not key.upper().startswith("LOCAL_PRINCIPAL_")}
+    env.update({
+        "CAPABILITY_UI_BASE_URL": base_url,
+        "CAPABILITY_FIXTURE_MANIFEST": str(fixture_manifest.resolve()),
+        "CAPABILITY_PLAYWRIGHT_OUTPUT_DIR": str(output.resolve()),
+    })
+    command = ["npm", "exec", "--", "playwright", "test", "--config=playwright.capability.config.ts", "--grep", grep]
+    log_path = evidence / ("browser-" + phase_name + ".log")
+    try:
+        result = subprocess.run(command, cwd=ui_path, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+    except subprocess.TimeoutExpired as error:
+        output_text = error.stdout or ""
+        if isinstance(output_text, bytes):
+            output_text = output_text.decode(errors="replace")
+        log_path.write_text(output_text[-200_000:])
+        raise GateError(f"Capability browser phase timed out after 600 seconds; see {log_path}.") from error
+    log_path.write_text((result.stdout or "")[-200_000:])
+    if result.returncode:
+        raise GateError(f"Capability browser phase {grep!r} failed ({result.returncode}); see {log_path}.\n" + (result.stdout or "")[-6000:])
+
+
+def verify_browser_runner(ui_path: Path) -> dict[str, str]:
+    if not shutil.which("npm") or not shutil.which("node"):
+        raise GateError("Candidate browser validation requires host Node.js and npm.")
+    if not (ui_path / "playwright.capability.config.ts").is_file():
+        raise GateError(f"UI source is missing playwright.capability.config.ts: {ui_path}")
+    if not (ui_path / "node_modules" / "@playwright" / "test" / "package.json").is_file():
+        raise GateError(f"Playwright is not installed in the UI checkout; run `npm ci` in {ui_path}.")
+
+    env = {**os.environ, "npm_config_offline": "true"}
+    try:
+        runner = subprocess.run(
+            ["npm", "exec", "--", "playwright", "--version"], cwd=ui_path, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise GateError("Playwright CLI preflight timed out before Docker build.") from error
+    if runner.returncode:
+        raise GateError(f"Playwright CLI preflight failed before Docker build:\n{(runner.stdout or '')[-2000:]}")
+    version = (runner.stdout or "").strip().splitlines()[-1]
+
+    configured = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+    if configured:
+        browser_path = Path(configured).expanduser().resolve()
+    else:
+        try:
+            browser = subprocess.run(
+                ["node", "-e", "process.stdout.write(require('playwright').chromium.executablePath())"],
+                cwd=ui_path, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise GateError("Playwright Chromium path preflight timed out before Docker build.") from error
+        if browser.returncode:
+            raise GateError(f"Could not resolve Playwright Chromium before Docker build:\n{(browser.stdout or '')[-2000:]}")
+        browser_path = Path((browser.stdout or "").strip())
+    if not browser_path.is_file() or not os.access(browser_path, os.X_OK):
+        raise GateError(
+            f"Chromium is unavailable at {browser_path}; run `npx playwright install chromium` in {ui_path} "
+            "or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to an executable system Chromium."
+        )
+    return {"playwrightVersion": version, "chromiumExecutable": str(browser_path)}
+
+
 def source_info(path_text: str, label: str) -> tuple[Path, dict[str, object]]:
     path = Path(path_text).expanduser().resolve()
     if not path.is_dir():
@@ -170,12 +266,12 @@ def wait_http(url: str, *, expected: int = 200, headers: dict[str, str] | None =
     raise GateError(f"Timed out waiting for {url} to return HTTP {expected}; last response: {last}")
 
 
-def request_json(base: str, path: str, token: str, *, body: dict | None = None, expected: int = 200) -> dict:
+def request_json(base: str, path: str, token: str, *, body: dict | None = None, expected: int = 200, method: str | None = None) -> dict:
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(base + path, data=data, headers=headers, method="POST" if data is not None else "GET")
+    request = urllib.request.Request(base + path, data=data, headers=headers, method=method or ("POST" if data is not None else "GET"))
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             status, content = response.status, response.read()
@@ -188,6 +284,294 @@ def request_json(base: str, path: str, token: str, *, body: dict | None = None, 
     if status != expected:
         raise GateError(f"{request.method} {path} returned HTTP {status}, expected {expected}: {json.dumps(value)[:1200]}")
     return value
+
+
+def request_json_local(base: str, path: str, *, body: dict | None = None, expected: int = 200, method: str | None = None) -> dict:
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base + path, data=data, headers=headers, method=method or ("POST" if data is not None else "GET"))
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            status, content = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, content = error.code, error.read()
+    try:
+        value = json.loads(content)
+    except Exception:
+        value = {"raw": content[:500].decode(errors="replace")}
+    if status != expected:
+        raise GateError(f"{request.method} {path} returned HTTP {status}, expected {expected}: {json.dumps(value)[:1200]}")
+    return value
+
+
+def create_borrowing_browser_fixture(base: str, token: str, household_id: str, person_id: str, chequing_id: str) -> dict[str, object]:
+    start, end = "2026-01-01", "2080-12-31"
+
+    richer_chequing = request_json(base, f"/api/v1/accounts/{chequing_id}/balances", token, body={
+        "effectiveDate": start,
+        "expectedRevision": 1,
+        "amount": "2500000.10",
+        "sourceKind": "user_reported",
+        "sourceLabel": "Disposable SLED-180 long-horizon fabricated balance",
+    }, expected=201)
+    if richer_chequing.get("amount") != "2500000.10" or richer_chequing.get("revision") != 2:
+        raise GateError(f"Long-horizon Chequing revision did not retain its exact amount: {richer_chequing}")
+
+    def create_account(name: str, account_type: str, amount: str) -> tuple[str, int]:
+        account = request_json(base, "/api/v1/accounts", token, body={
+            "householdId": household_id,
+            "displayName": name,
+            "accountType": account_type,
+            "defaultCurrency": "CAD",
+            "ownerships": [{"personId": person_id, "share": "1", "effectiveStart": start}],
+        }, expected=201)
+        account_id = account.get("id")
+        if not account_id:
+            raise GateError(f"{account_type} fixture Account response omitted its ID: {account}")
+        balance = request_json(base, f"/api/v1/accounts/{account_id}/balances", token, body={
+            "effectiveDate": start,
+            "expectedRevision": 0,
+            "amount": amount,
+            "sourceKind": "user_reported",
+            "sourceLabel": "Disposable SLED-180 fabricated fixture",
+        }, expected=201)
+        if balance.get("amount") != amount or balance.get("revision") != 1:
+            raise GateError(f"{account_type} fixture balance did not retain exact amount/revision: {balance}")
+        return account_id, balance["revision"]
+
+    non_registered_id, non_registered_revision = create_account("Disposable Non-Registered", "Non-Registered", "250000.00")
+    rrsp_id, rrsp_revision = create_account("Disposable RRSP", "RRSP", "250000.00")
+    classifications = request_json(base, f"/api/v1/people/{person_id}/registered-account-classifications", token, method="PUT", body={
+        "classifications": [{
+            "accountId": rrsp_id,
+            "effectiveStart": start,
+            "effectiveEnd": end,
+            "sourceKind": "user_reported",
+            "sourceLabel": "Disposable SLED-180 fabricated RRSP classification",
+        }],
+    })
+    classified_accounts = classifications.get("classifications", [])
+    if not any(item.get("accountId") == rrsp_id and item.get("effectiveStart") == start and item.get("effectiveEnd") == end for item in classified_accounts):
+        raise GateError(f"RRSP classification fixture was not persisted over the planning horizon: {classifications}")
+    # The compiler needs observed RRSP room for contribution years and for the
+    # active retirement-funding source. A deliberately generous fabricated
+    # amount also lets the stress-suite candidate compile before it fails on
+    # available cash.
+    for year in range(2026, 2081):
+        room_date = f"{year}-01-01"
+        room = request_json(base, f"/api/v1/people/{person_id}/registered-plan-room-revisions", token, body={
+            "planKind": "RRSP",
+            "effectiveDate": room_date,
+            "expectedRevision": 0,
+            "amount": "3000000.00",
+            "sourceKind": "user_reported",
+            "sourceLabel": "Disposable SLED-180 fabricated RRSP room",
+        }, expected=201)
+        if room.get("planKind") != "RRSP" or room.get("effectiveDate") != room_date or room.get("amount") != "3000000.00" or room.get("revision") != 1:
+            raise GateError(f"RRSP room fixture did not retain its exact dated observation: {room}")
+    basis = request_json(base, f"/api/v1/accounts/{non_registered_id}/cost-basis-revisions", token, body={
+        "effectiveDate": start,
+        "expectedRevision": 0,
+        "amount": "180000.00",
+        "sourceKind": "user_reported",
+        "sourceLabel": "Disposable SLED-180 fabricated basis",
+    }, expected=201)
+    if basis.get("amount") != "180000.00" or basis.get("revision") != 1:
+        raise GateError(f"Non-Registered basis fixture did not retain exact amount/revision: {basis}")
+
+    liability = request_json(base, "/api/v1/liabilities", token, body={
+        "householdId": household_id,
+        "displayName": "Disposable unpriced credit line",
+        "liabilityType": "Line of Credit",
+        "defaultCurrency": "CAD",
+        "purpose": "investment",
+        "responsibilities": [{"personId": person_id, "share": "1", "effectiveStart": start}],
+        "rateHistory": [],
+    }, expected=201)
+    liability_id = liability.get("id")
+    if not liability_id:
+        raise GateError(f"Credit-line fixture Liability response omitted its ID: {liability}")
+    liability_balance = request_json(base, f"/api/v1/liabilities/{liability_id}/balances", token, body={
+        "effectiveDate": start,
+        "expectedRevision": 0,
+        "amount": "0.00",
+        "sourceKind": "user_reported",
+        "sourceLabel": "Disposable SLED-180 unpriced credit-line baseline",
+    }, expected=201)
+    if liability_balance.get("amount") != "0.00" or liability_balance.get("revision") != 1:
+        raise GateError(f"Credit-line fixture balance did not retain exact amount/revision: {liability_balance}")
+
+    payment = request_json(base, "/api/v1/cashflows", token, body={
+        "name": "Disposable existing credit-line payment",
+        "direction": "outflow",
+        "category": "debt_payment",
+        "frequency": "monthly",
+        "amount": "250.00",
+        "indexation": "none",
+        "allocations": [{"personId": person_id, "share": "1"}],
+        "startDate": start,
+        "endDate": end,
+        "notes": "Fabricated payment binding for the disposable real-stack gate",
+    }, expected=201)
+    payment_id = payment.get("id")
+    if not payment_id:
+        raise GateError(f"Credit-line Cashflow fixture response omitted its ID: {payment}")
+
+    contribution = request_json(base, "/api/v1/cashflows", token, body={
+        "name": "Disposable RRSP contribution",
+        "direction": "outflow",
+        "category": "investment_contribution",
+        "frequency": "monthly",
+        "amount": "1000.00",
+        "indexation": "none",
+        "allocations": [{"personId": person_id, "share": "1"}],
+        "startDate": start,
+        "endDate": "2045-12-31",
+        "notes": "Fabricated registered contribution for the disposable real-stack gate",
+    }, expected=201)
+    contribution_id = contribution.get("id")
+    if not contribution_id:
+        raise GateError(f"Registered contribution fixture Cashflow response omitted its ID: {contribution}")
+
+    withdrawal = request_json(base, "/api/v1/cashflows", token, body={
+        "name": "Disposable RRSP retirement withdrawal",
+        "direction": "inflow",
+        "category": "investment_withdrawal",
+        "frequency": "annual",
+        # $50,000 is large enough to produce positive modeled Canadian tax
+        # after long-horizon indexed credits, while remaining well inside the
+        # projected RRSP balance through the fixture's 2080 horizon.
+        "amount": "50000.00",
+        "indexation": "none",
+        "allocations": [{"personId": person_id, "share": "1"}],
+        "startDate": "2060-01-01",
+        "endDate": end,
+        "notes": "Fabricated registered withdrawal for the disposable real-stack gate",
+    }, expected=201)
+    withdrawal_id = withdrawal.get("id")
+    if not withdrawal_id:
+        raise GateError(f"Registered withdrawal fixture Cashflow response omitted its ID: {withdrawal}")
+
+    attributions = request_json(base, f"/api/v1/people/{person_id}/tax-attributions", token, method="PUT", body={
+        "attributions": [{
+            "sourceKind": "account",
+            "sourceId": rrsp_id,
+            "category": "taxable_withdrawal",
+            "allocationMethod": "owner_share",
+            "effectiveStart": start,
+            "effectiveEnd": end,
+            "notes": "Disposable SLED-180 fabricated taxable RRSP withdrawal attribution",
+        }],
+    })
+    if not any(item.get("sourceId") == rrsp_id and item.get("category") == "taxable_withdrawal" and item.get("effectiveStart") == start and item.get("effectiveEnd") == end for item in attributions.get("attributions", [])):
+        raise GateError(f"RRSP taxable-withdrawal attribution was not persisted: {attributions}")
+
+    profiles = request_json(base, f"/api/v1/people/{person_id}/tax-profiles", token, method="PUT", body={
+        "profiles": [{"taxCountry": "CA", "taxRegion": "ON", "residencyStatus": "resident", "effectiveStart": start, "effectiveEnd": end,
+                      "notes": "Fabricated resident tax profile for SLED-180 disposable forecast"}],
+    })
+    if len(profiles.get("profiles", [])) != 1:
+        raise GateError(f"Person tax-profile fixture was not persisted: {profiles}")
+
+    selections = [
+        {"kind": "account_balance", "recordId": chequing_id, "effectiveDate": start, "revision": 2},
+        {"kind": "account_balance", "recordId": non_registered_id, "effectiveDate": start, "revision": non_registered_revision},
+        {"kind": "account_balance", "recordId": rrsp_id, "effectiveDate": start, "revision": rrsp_revision},
+        {"kind": "liability_balance", "recordId": liability_id, "effectiveDate": start, "revision": 1},
+    ]
+    snapshot = request_json(base, f"/api/v1/households/{household_id}/snapshots", token, body={
+        "name": "Disposable long-horizon borrowing baseline",
+        "asOfDate": start,
+        "notes": "SLED-180 fabricated long-horizon fixture",
+        "selections": selections,
+    }, expected=201)
+    snapshot_id = snapshot.get("draft", {}).get("id")
+    version = snapshot.get("draft", {}).get("version")
+    if not snapshot_id or not version or len(snapshot.get("included", [])) != len(selections):
+        raise GateError(f"Long-horizon fixture Snapshot did not include every selected balance: {snapshot}")
+    finalized = request_json(base, f"/api/v1/households/{household_id}/snapshots/{snapshot_id}/finalize", token,
+                             body={"expectedVersion": version}, expected=200)
+    snapshot_hash = finalized.get("finalized", {}).get("contentHash")
+    if not snapshot_hash:
+        raise GateError("Long-horizon fixture Snapshot did not finalize with a content hash.")
+    return {
+        "householdId": household_id,
+        "personId": person_id,
+        "snapshotId": snapshot_id,
+        "snapshotAsOfDate": start,
+        "scenarioStartDate": start,
+        "scenarioEndDate": end,
+        "rulePackVersion": RULE_PACK,
+        "accountIds": {"chequing": chequing_id, "nonRegistered": non_registered_id, "rrsp": rrsp_id},
+        "accountLabels": {"chequing": "Fixture Chequing", "nonRegistered": "Disposable Non-Registered", "rrsp": "Disposable RRSP"},
+        "liabilityIds": {"creditLine": liability_id},
+        "cashflowIds": {"debtPayment": payment_id, "registeredContribution": contribution_id, "registeredWithdrawal": withdrawal_id},
+        "basis": {"accountId": non_registered_id, "effectiveDate": start, "revision": 1, "amount": "180000.00"},
+        "expected": {"drawAmount": "5000.00", "annualRate": "0.06", "monthlyPayment": "250.00", "basisDate": start, "taxModelVersion": "ca-on-personal-tax-2026-v3-investment", "registeredWithdrawalAmount": "50000.00", "registeredWithdrawalMonthlyAmount": "4166.67", "registeredWithdrawalStartDate": "2060-01-01", "registeredContributionCandidateAmount": "2600000.00"},
+        "snapshotHash": snapshot_hash,
+    }
+
+
+def create_unfunded_contribution_suite(base: str, fixture: dict[str, object], browser_artifacts: dict[str, object]) -> dict[str, object]:
+    household_id = str(fixture["householdId"])
+    scenario_id = str(browser_artifacts.get("scenarioId", ""))
+    compilation_version = browser_artifacts.get("compilationVersion")
+    if not scenario_id or not isinstance(compilation_version, int) or compilation_version < 1:
+        raise GateError(f"Browser Scenario artifacts omitted a valid Scenario ID or compilation version: {browser_artifacts}")
+    recipe_history = request_json_local(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/planning-recipes")
+    revision = recipe_history.get("headRevision")
+    if not isinstance(revision, int) or revision < 1:
+        raise GateError(f"Browser-authored Scenario has no saved planning recipe: {recipe_history}")
+    recipe = request_json_local(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/planning-recipes/{revision}")
+    choices = recipe.get("choices")
+    if not isinstance(choices, dict):
+        raise GateError(f"Browser-authored recipe has no complete compiler choices: {recipe}")
+    contribution_id = fixture["cashflowIds"]["registeredContribution"]
+    rrsp_id = fixture["accountIds"]["rrsp"]
+    bindings = choices.get("cashflowBindings", [])
+    contribution_binding = next((item for item in bindings if item.get("cashflowId") == contribution_id), None)
+    if contribution_binding is None or contribution_binding.get("destinationAccountId") != rrsp_id:
+        raise GateError(f"Browser recipe does not bind the registered contribution to the seeded RRSP: {bindings}")
+
+    unfundable_choices = copy.deepcopy(choices)
+    cashflow_choices = unfundable_choices.setdefault("cashflowChoices", [])
+    selected = next((item for item in cashflow_choices if item.get("cashflowId") == contribution_id), None)
+    if selected is None:
+        selected = {"cashflowId": contribution_id}
+        cashflow_choices.append(selected)
+    selected["included"] = True
+    selected["schedule"] = {
+        "amount": str(fixture["expected"]["registeredContributionCandidateAmount"]),
+        "frequency": "monthly",
+        "effectiveStart": str(fixture["scenarioStartDate"]),
+        "effectiveEnd": str(fixture["scenarioStartDate"]),
+        "indexation": "none",
+        "assumptionLabel": "Deliberately unfundable registered contribution",
+    }
+    command = {
+        "compilationVersion": compilation_version,
+        "rulePackVersion": fixture["rulePackVersion"],
+        "referenceCandidateId": "base",
+        "candidates": [
+            {"candidateId": "funded-peer", "label": "Funded contribution peer", "changes": {"name": "Funded contribution peer"}, "choices": choices},
+            {"candidateId": "unfunded-contribution", "label": "Deliberately unfundable RRSP contribution", "changes": {"name": "Deliberately unfundable RRSP contribution"}, "choices": unfundable_choices},
+        ],
+    }
+    suite = request_json_local(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/stress-suites", body=command, expected=201)
+    suite_id = suite.get("suiteId")
+    suite_candidates = {item.get("candidateId"): item for item in suite.get("candidates", [])}
+    if not suite_id or suite_candidates.get("funded-peer", {}).get("status") != "ready" or suite_candidates.get("unfunded-contribution", {}).get("status") != "ready":
+        raise GateError(f"Prepared contribution suite is missing a ready candidate: {suite}")
+    return {"suite": {
+        "scenarioId": scenario_id,
+        "suiteId": suite_id,
+        "successCandidateId": "funded-peer",
+        "failedCandidateId": "unfunded-contribution",
+        "recipeRevision": revision,
+        "compilationVersion": compilation_version,
+    }}
 
 
 def assert_run_artifact(run: dict, run_id: str, compilation_hash: str, result_hash: str) -> None:
@@ -422,6 +806,7 @@ def write_override(temp: Path, issuer: str, project: str, pair_sha: str = "test-
                 "image": api_image,
                 "build": {"target": "capability-api", "labels": build_labels},
                 "environment": {
+                    "OIDC_ENABLED": "true",
                     "OIDC_ISSUER": issuer,
                     "OIDC_AUDIENCE": "finance-game-capability",
                     "OIDC_JWKS_URL": issuer + ".well-known/jwks.json",
@@ -451,6 +836,23 @@ def write_override(temp: Path, issuer: str, project: str, pair_sha: str = "test-
         }
     }
     path = temp / "compose.capability.yaml"
+    path.write_text(json.dumps(override, indent=2) + "\n")
+    return path
+
+
+def write_local_auth_override(temp: Path, principal_issuer: str, principal_subject: str) -> Path:
+    override = {
+        "services": {
+            "api": {
+                "environment": {
+                    "OIDC_ENABLED": "false",
+                    "LOCAL_PRINCIPAL_ISSUER": principal_issuer,
+                    "LOCAL_PRINCIPAL_SUBJECT": principal_subject,
+                },
+            },
+        },
+    }
+    path = temp / "compose.local-auth.yaml"
     path.write_text(json.dumps(override, indent=2) + "\n")
     return path
 
@@ -496,12 +898,14 @@ def remove_recovery_image_tags(tags: list[str]) -> None:
             run(["docker", "image", "rm", reference], capture=True)
 
 
-def compose_command(temp: Path, override: Path, project: str, recovery_override: Path | None = None) -> list[str]:
+def compose_command(temp: Path, override: Path, project: str, recovery_override: Path | None = None, extra_overrides: list[Path] | None = None) -> list[str]:
     empty_env = temp / "empty.env"
     empty_env.write_text("# Isolated capability run; no repository .env is loaded.\n")
     command = ["docker", "compose", "--env-file", str(empty_env), "--project-directory", str(ROOT), "-p", project, "-f", str(ROOT / "compose.yaml"), "-f", str(override)]
     if recovery_override:
         command.extend(["-f", str(recovery_override)])
+    for extra in extra_overrides or []:
+        command.extend(["-f", str(extra)])
     return command
 
 
@@ -552,18 +956,48 @@ def main() -> int:
     parser.add_argument("--no-cache", action="store_true", help="build all source images without Docker cache")
     parser.add_argument("--recovery-rehearsal", action="store_true", help="back up the fabricated database, rehearse an incompatible-schema failure, and restore into a second isolated project")
     parser.add_argument("--precommit-validation", action="store_true", help="validate a dirty candidate worktree without issuing runtime qualification")
+    parser.add_argument("--candidate-manifest", type=Path, help="exact Go/UI revisions for non-qualifying candidate validation")
+    parser.add_argument("--borrowing-browser", action="store_true", help="run the opt-in real-browser long-horizon borrowing workflow")
     args = parser.parse_args()
+
+    if args.borrowing_browser != bool(args.candidate_manifest):
+        raise GateError("--borrowing-browser and --candidate-manifest must be supplied together.")
+    if args.candidate_manifest and not args.no_cache:
+        raise GateError("Candidate validation requires --no-cache so every source image is built from the selected revisions.")
+    if args.candidate_manifest and args.recovery_rehearsal:
+        raise GateError("Candidate browser validation cannot issue recovery or release qualification evidence.")
+    candidate_sources = None
+    candidate_manifest_sha = None
+    if args.candidate_manifest:
+        candidate_sources, candidate_manifest_sha = load_candidate_manifest(args.candidate_manifest)
 
     go_path, go_info = source_info(args.go_source, "Go")
     ui_path, ui_info = source_info(args.ui_source, "UI")
+    browser_runner = verify_browser_runner(ui_path) if args.borrowing_browser else None
     pair, pair_sha = load_release_pair()
-    try:
-        release_pair.validate_source_revisions(
-            pair, str(go_info["revision"]), str(ui_info["revision"]),
-            go_dirty=bool(go_info["dirty"]), ui_dirty=bool(ui_info["dirty"]),
+    if candidate_sources is not None:
+        validate_candidate_revisions(candidate_sources, str(go_info["revision"]), str(ui_info["revision"]))
+        candidate_pair_sha = hashlib.sha256(json.dumps(
+            {"baselineReleasePairSha256": pair_sha, "candidateManifestSha256": candidate_manifest_sha},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        release_id = f"candidate-validation-{candidate_pair_sha[:12]}"
+        qualification_status = "candidate-validation"
+        schema_version_expected = release.deployed_schema_version(
+            {"mode": "local-override", "path": str(go_path)}, pair,
         )
-    except release_pair.ReleasePairError as error:
-        raise GateError(str(error)) from error
+    else:
+        try:
+            release_pair.validate_source_revisions(
+                pair, str(go_info["revision"]), str(ui_info["revision"]),
+                go_dirty=bool(go_info["dirty"]), ui_dirty=bool(ui_info["dirty"]),
+            )
+        except release_pair.ReleasePairError as error:
+            raise GateError(str(error)) from error
+        candidate_pair_sha = pair_sha
+        release_id = pair["releaseId"]
+        qualification_status = pair["qualification"]["status"]
+        schema_version_expected = pair["compatibility"]["databaseSchemaVersion"]
     compatibility = pair["compatibility"]
     fixture_contract = compatibility["capabilityFixture"]
     rule_pack = compatibility["rulePackVersion"]
@@ -607,7 +1041,7 @@ def main() -> int:
         cleanup_temp_directory(temp)
         raise
     env.update({"GO_SOURCE": str(go_build_source), "UI_SOURCE": str(ui_build_source), "UI_PORT": str(port), "BIND_ADDRESS": "127.0.0.1", "POSTGRES_PASSWORD": secrets.token_urlsafe(32), "CAPABILITY_TEMP_ROOT": str(temp), "CAPABILITY_PROJECT": project,
-                "RELEASE_ID": pair["releaseId"], "RELEASE_PAIR_SHA256": pair_sha, "RELEASE_QUALIFICATION": pair["qualification"]["status"],
+                "OIDC_ENABLED": "true", "RELEASE_ID": release_id, "RELEASE_PAIR_SHA256": candidate_pair_sha, "RELEASE_QUALIFICATION": qualification_status,
                 "GO_SOURCE_REVISION": go_info["revision"], "UI_SOURCE_REVISION": ui_info["revision"]})
     recovery_project = "fgcap-" + uuid.uuid4().hex[:12] if args.recovery_rehearsal else ""
     recovery_port = free_port() if args.recovery_rehearsal else 0
@@ -629,18 +1063,28 @@ def main() -> int:
         shutil.copy2(ROOT / "scripts" / "capability_oidc.py", fixture_dir / "capability_oidc.py")
         (fixture_dir / "jwks.json").write_text(json.dumps({"keys": [rsa_jwk((temp / "signing.pub.der").read_bytes())]}, separators=(",", ":")))
         issuer = "https://oidc:8443/"
-        override = write_override(temp, issuer, project, pair_sha)
+        override = write_override(temp, issuer, project, candidate_pair_sha)
         compose = compose_command(temp, override, project)
     except BaseException:
         cleanup_temp_directory(temp)
         raise
     manifest: dict[str, object] = {"project": project, "uiPort": port, "goSource": go_info, "uiSource": ui_info,
-                                   "releaseId": pair["releaseId"], "releasePairSha256": pair_sha,
-                                   "qualificationStatus": pair["qualification"]["status"], "compatibility": compatibility,
+                                   "releaseId": release_id, "releasePairSha256": candidate_pair_sha,
+                                   "baselineReleasePairSha256": pair_sha,
+                                   "qualificationStatus": qualification_status, "compatibility": compatibility,
                                    "bundleRevision": bundle_revision, "bundleWorktreeSha256": bundle_tree_sha,
-                                   "validationMode": "precommit" if args.precommit_validation else "clean-checkout",
+                                   "browserRunner": browser_runner,
+                                   "validationMode": "candidate-browser" if candidate_sources is not None else ("precommit" if args.precommit_validation else "clean-checkout"),
                                    "rulePackVersion": rule_pack, "fixtureOnly": True, "recoveryRehearsal": args.recovery_rehearsal,
                                    "evidenceDirectory": str(evidence), "phases": []}
+    if candidate_sources is not None:
+        manifest["candidateManifest"] = {
+            "sha256": candidate_manifest_sha,
+            "goRevision": candidate_sources["goRevision"],
+            "uiRevision": candidate_sources["uiRevision"],
+            "path": str(args.candidate_manifest.expanduser().resolve()),
+            "runtimeQualification": False,
+        }
     created_projects: list[tuple[list[str], dict[str, str], str, str]] = []
     recovery_image_tags: list[str] = []
     projects_cleaned = False
@@ -730,13 +1174,13 @@ def main() -> int:
         person = request_json(base, "/api/v1/people", token, body={"name": "Capability Fixture", "birthDate": "1980-06", "region": "ON", "preferredCurrency": "CAD", "notes": "Disposable SLED-86 fixture"}, expected=201)
         household = request_json(base, "/api/v1/households", token, body={"name": "Capability Fixture Household", "personIds": [person["id"]], "notes": "Disposable SLED-86 fixture"}, expected=201)
         household_id, person_id = household["id"], person["id"]
-        account = request_json(base, "/api/v1/accounts", token, body={"householdId": household_id, "displayName": "Fixture Chequing", "accountType": "Chequing", "defaultCurrency": "CAD", "ownerships": [{"personId": person_id, "share": "1"}]}, expected=201)
+        account = request_json(base, "/api/v1/accounts", token, body={"householdId": household_id, "displayName": "Fixture Chequing", "accountType": "Chequing", "defaultCurrency": "CAD", "ownerships": [{"personId": person_id, "share": "1", "effectiveStart": "2026-01-01"}]}, expected=201)
         account_id = account.get("id", account.get("account", {}).get("id"))
         if not account_id:
             raise GateError(f"Account response did not contain its ID: {account}")
         ownerships = account.get("ownerships") or []
-        if len(ownerships) != 1 or ownerships[0].get("share") != "1":
-            raise GateError(f"Account ownership share was not preserved as exact decimal text: {ownerships}")
+        if len(ownerships) != 1 or ownerships[0].get("share") != "1" or ownerships[0].get("effectiveStart") != "2026-01-01":
+            raise GateError(f"Account ownership share/effective start was not preserved: {ownerships}")
         balance = request_json(base, f"/api/v1/accounts/{account_id}/balances", token, body={"effectiveDate": "2026-01-01", "expectedRevision": 0, "amount": "100000.10", "sourceKind": "user_reported", "sourceLabel": "Disposable capability fixture"}, expected=201)
         if balance.get("amount") != "100000.10":
             raise GateError(f"Account balance did not round-trip as the exact decimal string: {balance}")
@@ -758,8 +1202,10 @@ def main() -> int:
         compiled_content = compiled.get("content") or compiled.get("compilation", {}).get("content") or {}
         observed_compiler = {"compiledInputSchemaVersion": compiled_content.get("schemaVersion"), "compilerVersion": compiled_content.get("compilerVersion")}
         expected_compiler = {"compiledInputSchemaVersion": fixture_contract["compiledInputSchemaVersion"], "compilerVersion": fixture_contract["compilerVersion"]}
-        if observed_compiler != expected_compiler:
+        if candidate_sources is None and observed_compiler != expected_compiler:
             raise GateError(f"Compiled-input compatibility mismatch: expected {expected_compiler}, received {observed_compiler}.")
+        if candidate_sources is not None and not all(observed_compiler.values()):
+            raise GateError(f"Candidate compiled-input compatibility values are incomplete: {observed_compiler}.")
         compilation_version = compiled.get("version", compiled.get("compilation", {}).get("version"))
         compilation_hash = compiled.get("contentHash", compiled.get("compilation", {}).get("contentHash"))
         if not compilation_version or not compilation_hash:
@@ -848,24 +1294,66 @@ def main() -> int:
         assert_fixture_report(request_json(base, f"/api/v1/households/{household_id}/scenarios/{scenario_id}/runs/{run_id}/results", token))
         observed_run = {"timelineCalculationVersion": run_response.get("calculationVersion"), "runArtifactVersion": run_response.get("artifactVersion")}
         expected_run = {"timelineCalculationVersion": fixture_contract["timelineCalculationVersion"], "runArtifactVersion": fixture_contract["runArtifactVersion"]}
-        if observed_run != expected_run:
+        if candidate_sources is None and observed_run != expected_run:
             raise GateError(f"Run compatibility mismatch: expected {expected_run}, received {observed_run}.")
+        if candidate_sources is not None and not all(observed_run.values()):
+            raise GateError(f"Candidate Run compatibility values are incomplete: {observed_run}.")
         result_body = run_response.get("result") or {}
         report = result_body.get("report") or {}
         readiness = result_body.get("readiness") or {}
         observed_report = {"reportSchemaVersion": report.get("schemaVersion"), "reportCalculationVersion": report.get("calculationVersion"),
                            "readinessSchemaVersion": readiness.get("schemaVersion"), "readinessCalculationVersion": readiness.get("calculationVersion")}
         expected_report = {key: fixture_contract[key] for key in observed_report}
-        if observed_report != expected_report:
+        if candidate_sources is None and observed_report != expected_report:
             raise GateError(f"Run report compatibility mismatch: expected {expected_report}, received {observed_report}.")
+        if candidate_sources is not None and not all(observed_report.values()):
+            raise GateError(f"Candidate report compatibility values are incomplete: {observed_report}.")
         manifest["observedCompatibility"] = {"rulePackVersion": rule_pack, **observed_compiler, **observed_run, **observed_report}
         manifest["artifacts"] = {"householdId": household_id, "personId": person_id, "accountId": account_id, "exactOwnershipShare": "1", "exactBalance": "100000.10", "snapshotId": snapshot_id, "snapshotHash": finalized_hash, "scenarioId": scenario_id, "compilationVersion": compilation_version, "compilationHash": compilation_hash, "runId": run_id, "runHash": run_hash, "secondRunId": second_run_id, "historyGoalId": goal.get("id"), "householdRunHistoryPageIds": household_history_ids, "householdRunHistoryPageCount": household_history_page_count, "scenarioRunHistoryIds": sorted(scenario_history_ids), "runResultHash": result_hash, "alternativeScenarioId": comparison_alternative, "comparisonId": comparison_id, "comparisonReopened": reopened_comparison.get("id") == comparison_id, "comparisonDeltas": deltas, "missingPackError": missing_code}
         phase("fabricated-household-compile-run-reopen-compare", "passed", artifacts=manifest["artifacts"])
 
+        if args.borrowing_browser:
+            browser_fixture = create_borrowing_browser_fixture(base, token, household_id, person_id, account_id)
+            browser_fixture_path = evidence / "browser-fixture.json"
+            browser_fixture_path.write_text(json.dumps(browser_fixture, indent=2, sort_keys=True) + "\n")
+            local_override = write_local_auth_override(temp, issuer, "capability-runner")
+            local_compose = compose_command(temp, override, project, extra_overrides=[local_override])
+            inspect_config(local_compose, env)
+            run(local_compose + ["up", "--no-build", "--detach", "--force-recreate", "api"], env=env, capture=True)
+            wait_http(base + "/health/ready")
+            request_json_local(base, "/api/v1/reference/canadian-rule-packs")
+            phase("browser-fixture-seeded", "passed", fixture=browser_fixture)
+
+            run_capability_browser(ui_path, base, browser_fixture_path, evidence, grep="@scenario")
+            scenario_artifacts_path = evidence / "browser-artifacts" / "scenario" / "scenario-artifacts.json"
+            try:
+                scenario_artifacts = json.loads(scenario_artifacts_path.read_text())
+            except (OSError, json.JSONDecodeError) as error:
+                raise GateError(f"Real-browser Scenario test did not write valid artifacts to {scenario_artifacts_path}: {error}") from error
+            if (not isinstance(scenario_artifacts.get("scenarioId"), str)
+                    or not scenario_artifacts["scenarioId"].strip()
+                    or type(scenario_artifacts.get("compilationVersion")) is not int
+                    or scenario_artifacts["compilationVersion"] < 1):
+                raise GateError(f"Real-browser Scenario test artifacts are incomplete: {scenario_artifacts}")
+            suite_artifacts = create_unfunded_contribution_suite(base, browser_fixture, scenario_artifacts)
+            browser_fixture.update(suite_artifacts)
+            browser_fixture_path.write_text(json.dumps(browser_fixture, indent=2, sort_keys=True) + "\n")
+            phase("browser-scenario-compile-run", "passed", artifacts=scenario_artifacts)
+
+            run_capability_browser(ui_path, base, browser_fixture_path, evidence, grep="@suite")
+            manifest["browserFixture"] = browser_fixture
+            phase("browser-suite-failure-and-reopen", "passed", artifacts=suite_artifacts,
+                  browserArtifacts=str((evidence / "browser-artifacts" / "suite").resolve()))
+
+            run(compose + ["up", "--no-build", "--detach", "--force-recreate", "api"], env=env, capture=True)
+            wait_http(base + "/health/ready")
+            wait_http(base + "/api/v1/reference/canadian-rule-packs", headers=headers)
+            phase("oidc-mode-restored", "passed")
+
         # A recovery rehearsal captures a consistent backup before introducing an incompatible schema marker.
         max_version = database_schema_version(compose, env)
-        if max_version != compatibility["databaseSchemaVersion"]:
-            raise GateError(f"Database schema mismatch: expected migration {compatibility['databaseSchemaVersion']}, observed {max_version}.")
+        if max_version != schema_version_expected:
+            raise GateError(f"Database schema mismatch: expected migration {schema_version_expected}, observed {max_version}.")
         schema_migrations = migration_versions(compose, env)
         if args.recovery_rehearsal:
             verify_disposable_database(compose, env)
@@ -1024,7 +1512,7 @@ def main() -> int:
                 raise GateError("Bundle candidate changed during precommit validation; evidence does not match the final worktree.")
             manifest["candidateWorktreeUnchanged"] = True
             (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        if not args.keep and args.no_cache and not args.precommit_validation:
+        if not args.keep and args.no_cache and not args.precommit_validation and candidate_sources is None:
             receipt = {
                 "status": "runtime-qualified", "releaseId": pair["releaseId"], "releasePairSha256": pair_sha,
                 "sources": {"go": go_info["revision"], "ui": ui_info["revision"]},

@@ -46,6 +46,7 @@ class InspectConfigTests(unittest.TestCase):
         with patch.object(capability_gate, "run", return_value=result):
             capability_gate.inspect_config(["docker", "compose"], env)
 
+
     def test_accepts_project_scoped_resource_names(self) -> None:
         self.inspect(
             volume_name="fgcap-012345abcdef_postgres_data",
@@ -75,6 +76,110 @@ class InspectConfigTests(unittest.TestCase):
         env = {"CAPABILITY_PROJECT": "fgcap-012345abcdef", "CAPABILITY_TEMP_ROOT": "/tmp/fgcap-012345abcdef"}
         with patch.object(capability_gate, "run", return_value=result):
             capability_gate.inspect_config(["docker", "compose"], env)
+
+
+class CandidateManifestTests(unittest.TestCase):
+    go_revision = "a" * 40
+    ui_revision = "b" * 40
+
+    def test_loads_exact_candidate_pair_without_changing_release_contract(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate.json"
+            path.write_text(json.dumps({"formatVersion": 1, "goRevision": self.go_revision, "uiRevision": self.ui_revision}))
+            candidate, digest = capability_gate.load_candidate_manifest(path)
+        self.assertEqual(candidate["goRevision"], self.go_revision)
+        self.assertEqual(candidate["uiRevision"], self.ui_revision)
+        self.assertEqual(len(digest), 64)
+
+    def test_rejects_extra_fields_and_short_or_uppercase_revisions(self) -> None:
+        cases = [
+            {"formatVersion": 1, "goRevision": self.go_revision, "uiRevision": self.ui_revision, "qualification": "qualified"},
+            {"formatVersion": 1, "goRevision": "A" * 40, "uiRevision": self.ui_revision},
+            {"formatVersion": 1, "goRevision": self.go_revision, "uiRevision": "short"},
+        ]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate.json"
+            for value in cases:
+                path.write_text(json.dumps(value))
+                with self.subTest(value=value), self.assertRaises(capability_gate.GateError):
+                    capability_gate.load_candidate_manifest(path)
+
+    def test_requires_exact_source_revisions(self) -> None:
+        candidate = {"formatVersion": 1, "goRevision": self.go_revision, "uiRevision": self.ui_revision}
+        capability_gate.validate_candidate_revisions(candidate, self.go_revision, self.ui_revision)
+        with self.assertRaisesRegex(capability_gate.GateError, "uiRevision mismatch"):
+            capability_gate.validate_candidate_revisions(candidate, self.go_revision, "c" * 40)
+
+    def test_candidate_validation_requires_uncached_builds(self) -> None:
+        with TemporaryDirectory() as directory:
+            manifest = Path(directory) / "candidate.json"
+            manifest.write_text(json.dumps({"formatVersion": 1, "goRevision": self.go_revision, "uiRevision": self.ui_revision}))
+            argv = ["capability_gate.py", "--go-source", directory, "--ui-source", directory,
+                    "--candidate-manifest", str(manifest), "--borrowing-browser"]
+            with patch.object(capability_gate.sys, "argv", argv):
+                with self.assertRaisesRegex(capability_gate.GateError, "requires --no-cache"):
+                    capability_gate.main()
+
+
+class CapabilityBrowserRunnerTests(unittest.TestCase):
+    def test_uses_explicit_fixture_and_does_not_forward_credentials(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ui = root / "ui"
+            ui.mkdir()
+            (ui / "playwright.capability.config.ts").write_text("export default {};\n")
+            fixture = root / "fixture.json"
+            fixture.write_text("{}\n")
+            evidence = root / "evidence"
+            observed: dict[str, object] = {}
+
+            def completed(command: list[str], *, cwd: Path, env: dict[str, str], **_: object) -> subprocess.CompletedProcess[str]:
+                observed.update({"command": command, "cwd": cwd, "env": env})
+                return subprocess.CompletedProcess(command, 0, stdout="1 passed\n")
+
+            with patch.dict("os.environ", {"API_ACCESS_TOKEN": "secret", "OIDC_ISSUER": "https://issuer.test", "OIDC_ENABLED": "true"}, clear=True), \
+                 patch.object(capability_gate.subprocess, "run", side_effect=completed):
+                capability_gate.run_capability_browser(ui, "http://127.0.0.1:49152", fixture, evidence, grep="@scenario")
+            env = observed["env"]
+            self.assertEqual(env["CAPABILITY_UI_BASE_URL"], "http://127.0.0.1:49152")
+            self.assertEqual(env["CAPABILITY_FIXTURE_MANIFEST"], str(fixture.resolve()))
+            self.assertEqual(
+                env["CAPABILITY_PLAYWRIGHT_OUTPUT_DIR"],
+                str((evidence / "browser-artifacts" / "scenario").resolve()),
+            )
+            self.assertNotIn("API_ACCESS_TOKEN", env)
+            self.assertNotIn("OIDC_ISSUER", env)
+            self.assertNotIn("OIDC_ENABLED", env)
+            self.assertEqual((evidence / "browser-scenario.log").read_text(), "1 passed\n")
+
+    def test_browser_failure_retains_bounded_log(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ui = root / "ui"
+            ui.mkdir()
+            (ui / "playwright.capability.config.ts").write_text("export default {};\n")
+            fixture = root / "fixture.json"
+            fixture.write_text("{}\n")
+            evidence = root / "evidence"
+            with patch.object(capability_gate.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, stdout="browser failed\n")):
+                with self.assertRaisesRegex(capability_gate.GateError, "browser-.*log"):
+                    capability_gate.run_capability_browser(ui, "http://127.0.0.1:49152", fixture, evidence, grep="@suite")
+            self.assertEqual((evidence / "browser-suite.log").read_text(), "browser failed\n")
+
+    def test_browser_timeout_retains_partial_output(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ui = root / "ui"
+            ui.mkdir()
+            (ui / "playwright.capability.config.ts").write_text("export default {};\n")
+            fixture = root / "fixture.json"
+            fixture.write_text("{}\n")
+            evidence = root / "evidence"
+            error = subprocess.TimeoutExpired(["playwright"], 600, output="browser still running\n")
+            with patch.object(capability_gate.subprocess, "run", side_effect=error):
+                with self.assertRaisesRegex(capability_gate.GateError, "timed out"):
+                    capability_gate.run_capability_browser(ui, "http://127.0.0.1:49152", fixture, evidence, grep="@suite")
+            self.assertEqual((evidence / "browser-suite.log").read_text(), "browser still running\n")
 
 
 class RunAssertionTests(unittest.TestCase):
@@ -245,6 +350,23 @@ class CapabilityOverrideTests(unittest.TestCase):
         for service, image in zip(("migrate", "api", "ui"), capability_gate.capability_images(project)):
             self.assertEqual(override["services"][service]["image"], image)
             self.assertEqual(override["services"][service]["build"]["labels"][capability_gate.IMAGE_LABEL], project)
+
+    def test_candidate_pair_sha_is_baked_into_image_provenance(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        candidate_pair_sha = "c" * 64
+        with TemporaryDirectory() as directory:
+            override_path = capability_gate.write_override(
+                Path(directory), "https://oidc:8443/", "fgcap-012345abcdef", candidate_pair_sha,
+            )
+            override = json.loads(override_path.read_text())
+
+        for service in ("migrate", "api", "ui"):
+            self.assertEqual(
+                override["services"][service]["build"]["labels"]["org.financegame.release.pair-sha256"],
+                candidate_pair_sha,
+            )
 
 
 class RecoverySafetyTests(unittest.TestCase):
