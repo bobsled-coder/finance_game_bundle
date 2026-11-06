@@ -183,6 +183,44 @@ class CapabilityBrowserRunnerTests(unittest.TestCase):
 
 
 class RunAssertionTests(unittest.TestCase):
+    def test_accepts_frozen_taxable_source_cost_basis_and_dated_attribution(self) -> None:
+        capability_gate.assert_taxable_funding_compilation({"content": {
+            "retirementFundingPolicy": {"sources": [{
+                "accountId": "non-registered-1",
+                "fundingKind": "taxable_sale",
+                "effectiveStart": "2080-01-01",
+                "effectiveEnd": "2080-12-31",
+                "saleCostRate": "0.01",
+                "saleCostAssumptionLabel": "Disposable sale costs",
+            }]},
+            "portfolioBasis": [{"accountId": "non-registered-1", "revision": 1}],
+            "taxAttributions": [{
+                "sourceKind": "account",
+                "sourceId": "non-registered-1",
+                "category": category,
+                "allocationMethod": "owner_share",
+                "effectiveStart": "2026-01-01",
+                "effectiveEnd": "2080-12-31",
+            } for category in ("realized_capital_gain", "realized_capital_loss")],
+        }}, "non-registered-1", basis_revision=1, sale_cost_rate="0.01",
+            sale_cost_label="Disposable sale costs", start="2026-01-01", source_start="2080-01-01", end="2080-12-31")
+
+    def test_rejects_stale_pinned_basis_revision(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "did not pin"):
+            capability_gate.assert_taxable_funding_compilation({"content": {
+                "retirementFundingPolicy": {"sources": [{
+                    "accountId": "non-registered-1",
+                    "fundingKind": "taxable_sale",
+                    "effectiveStart": "2080-01-01",
+                    "effectiveEnd": "2080-12-31",
+                    "saleCostRate": "0.01",
+                    "saleCostAssumptionLabel": "Disposable sale costs",
+                }]},
+                "portfolioBasis": [{"accountId": "non-registered-1", "revision": 2}],
+                "taxAttributions": [],
+            }}, "non-registered-1", basis_revision=1, sale_cost_rate="0.01",
+                sale_cost_label="Disposable sale costs", start="2026-01-01", source_start="2080-01-01", end="2080-12-31")
+
     def test_accepts_expected_immutable_run_and_report(self) -> None:
         capability_gate.assert_run_artifact(
             {"id": "run-1", "status": "completed", "compilationHash": "c", "resultHash": "r"},
@@ -220,6 +258,148 @@ class RunAssertionTests(unittest.TestCase):
                     }
                 }
             )
+
+    def test_accepts_reconciled_taxable_retirement_sale_and_person_tax_allocation(self) -> None:
+        capability_gate.assert_taxable_retirement_funding_report(
+            {
+                "fundingEvents": [
+                    {"purpose": "retirement_spending", "requested": "100.00", "funded": "100.00", "unfunded": "0.00"},
+                    {"purpose": "tax_settlement", "requested": "45.00", "funded": "40.00", "unfunded": "5.00"},
+                ],
+                "periods": [{
+                    "periodStart": "2080-01-01",
+                    "reconciliation": {
+                        "openingNetWorthResidual": "0.00",
+                        "movementDeltaResidual": "0.00",
+                        "closingNetWorthResidual": "0.00",
+                    },
+                    "portfolioTrades": [{
+                        "id": "generated-sale-1",
+                        "accountId": "non-registered-1",
+                        "effectiveDate": "2080-01-01",
+                        "fundingSourceId": "taxable-source-1",
+                        "fundingPurpose": "retirement_spending",
+                        "grossProceeds": "100.00",
+                        "transactionCosts": "1.00",
+                        "disposedBasis": "60.00",
+                        "realizedGainLoss": "39.00",
+                        "netProceeds": "99.00",
+                        "closingMarketValue": "900.00",
+                        "closingBasis": "540.00",
+                        "taxableByPerson": [{"personId": "person-1", "amount": "39.00"}],
+                    }],
+                }, {
+                    "periodStart": "2080-12-01",
+                    "reconciliation": {
+                        "openingNetWorthResidual": "0.00",
+                        "movementDeltaResidual": "0.00",
+                        "closingNetWorthResidual": "0.00",
+                    },
+                    "portfolioTrades": [{
+                        "id": "generated-sale-2",
+                        "accountId": "non-registered-1",
+                        "effectiveDate": "2080-12-31",
+                        "fundingSourceId": "taxable-source-1",
+                        "fundingPurpose": "tax_settlement",
+                        "grossProceeds": "40.00",
+                        "transactionCosts": "0.40",
+                        "disposedBasis": "24.00",
+                        "realizedGainLoss": "15.60",
+                        "netProceeds": "39.60",
+                        "closingMarketValue": "0.00",
+                        "closingBasis": "0.00",
+                        "taxableByPerson": [{"personId": "person-1", "amount": "15.60"}],
+                    }],
+                }],
+            },
+            "non-registered-1",
+        )
+
+    def test_rejects_unreconciled_taxable_sale_or_missing_funding_evidence(self) -> None:
+        report = {
+            "fundingEvents": [{"purpose": "retirement_spending", "requested": "100.00", "funded": "100.00", "unfunded": "0.00"}],
+            "periods": [{
+                "periodStart": "2080-01-01",
+                "reconciliation": {"movementDeltaResidual": "0.01"},
+                "portfolioTrades": [{
+                    "id": "generated-sale-1",
+                    "accountId": "non-registered-1",
+                    "effectiveDate": "2080-01-01",
+                    "fundingSourceId": "taxable-source-1",
+                    "fundingPurpose": "retirement_spending",
+                    "grossProceeds": "100.00",
+                    "transactionCosts": "1.00",
+                    "disposedBasis": "60.00",
+                    "realizedGainLoss": "39.00",
+                    "netProceeds": "99.00",
+                    "closingMarketValue": "900.00",
+                    "closingBasis": "540.00",
+                    "taxableByPerson": [{"personId": "person-1", "amount": "39.00"}],
+                }],
+            }],
+        }
+        with self.assertRaisesRegex(capability_gate.GateError, "not reconciled"):
+            capability_gate.assert_taxable_retirement_funding_report(report, "non-registered-1")
+        report["periods"][0]["reconciliation"]["movementDeltaResidual"] = "0.00"
+        report["fundingEvents"] = []
+        with self.assertRaisesRegex(capability_gate.GateError, "no funded retirement cash-deficit"):
+            capability_gate.assert_taxable_retirement_funding_report(report, "non-registered-1")
+
+    def test_rejects_tax_settlement_sale_without_retirement_spending_sale(self) -> None:
+        report = {
+            "fundingEvents": [{"purpose": "tax_settlement", "funded": "99.00", "unfunded": "0.00"}],
+            "periods": [{
+                "reconciliation": {"movementDeltaResidual": "0.00"},
+                "portfolioTrades": [{
+                    "id": "generated-sale-1",
+                    "accountId": "non-registered-1",
+                    "effectiveDate": "2080-12-31",
+                    "fundingSourceId": "taxable-source-1",
+                    "fundingPurpose": "tax_settlement",
+                    "grossProceeds": "100.00",
+                    "transactionCosts": "1.00",
+                    "disposedBasis": "60.00",
+                    "realizedGainLoss": "39.00",
+                    "netProceeds": "99.00",
+                    "closingMarketValue": "0.00",
+                    "closingBasis": "0.00",
+                    "taxableByPerson": [{"personId": "person-1", "amount": "39.00"}],
+                }],
+            }],
+        }
+        with self.assertRaisesRegex(capability_gate.GateError, "no retirement-spending funding events"):
+            capability_gate.assert_taxable_retirement_funding_report(report, "non-registered-1")
+
+    def test_accepts_reconciled_taxable_sale_aggregates_in_suite_annual_outcomes(self) -> None:
+        capability_gate.assert_taxable_retirement_funding_suite({"outcome": {"annual": [{
+            "year": 2065,
+            "taxableSaleGrossProceeds": "100.00",
+            "taxableSaleTransactionCosts": "1.00",
+            "taxableSaleBasisConsumed": "60.00",
+            "taxableRealizedGainLoss": "39.00",
+            "taxableSaleNetProceeds": "99.00",
+            "estimatedTax": "12.00",
+            "taxSettlementPaid": "10.00",
+            "taxRefundReceived": "0.00",
+            "remainingTaxDueOrRefund": "2.00",
+            "debtBalances": "0.00",
+        }]}})
+
+    def test_rejects_suite_annual_sale_aggregate_mismatch(self) -> None:
+        with self.assertRaisesRegex(capability_gate.GateError, "do not reconcile"):
+            capability_gate.assert_taxable_retirement_funding_suite({"outcome": {"annual": [{
+                "year": 2065,
+                "taxableSaleGrossProceeds": "100.00",
+                "taxableSaleTransactionCosts": "1.00",
+                "taxableSaleBasisConsumed": "60.00",
+                "taxableRealizedGainLoss": "40.00",
+                "taxableSaleNetProceeds": "99.00",
+                "estimatedTax": "12.00",
+                "taxSettlementPaid": "10.00",
+                "taxRefundReceived": "0.00",
+                "remainingTaxDueOrRefund": "2.00",
+                "debtBalances": "0.00",
+            }]}})
 
 
 class ComposeBuildFailureTests(unittest.TestCase):

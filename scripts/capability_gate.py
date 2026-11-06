@@ -7,6 +7,7 @@ import argparse
 import base64
 import copy
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -330,6 +331,9 @@ def create_borrowing_browser_fixture(base: str, token: str, household_id: str, p
         account_id = account.get("id")
         if not account_id:
             raise GateError(f"{account_type} fixture Account response omitted its ID: {account}")
+        ownerships = account.get("ownerships") or []
+        if len(ownerships) != 1 or ownerships[0].get("personId") != person_id or ownerships[0].get("share") != "1" or ownerships[0].get("effectiveStart") != start:
+            raise GateError(f"{account_type} fixture did not persist the expected sole-owner share and effective date: {ownerships}")
         balance = request_json(base, f"/api/v1/accounts/{account_id}/balances", token, body={
             "effectiveDate": start,
             "expectedRevision": 0,
@@ -454,6 +458,22 @@ def create_borrowing_browser_fixture(base: str, token: str, household_id: str, p
     if not withdrawal_id:
         raise GateError(f"Registered withdrawal fixture Cashflow response omitted its ID: {withdrawal}")
 
+    retirement_spending = request_json(base, "/api/v1/cashflows", token, body={
+        "name": "Disposable retirement living expense",
+        "direction": "outflow",
+        "category": "living_expense",
+        "frequency": "monthly",
+        "amount": "50000.00",
+        "indexation": "none",
+        "allocations": [{"personId": person_id, "share": "1"}],
+        "startDate": "2080-01-01",
+        "endDate": end,
+        "notes": "Fabricated final-year retirement expense for the one-year terminal funding stress",
+    }, expected=201)
+    retirement_spending_id = retirement_spending.get("id")
+    if not retirement_spending_id:
+        raise GateError(f"Retirement living-expense fixture Cashflow response omitted its ID: {retirement_spending}")
+
     attributions = request_json(base, f"/api/v1/people/{person_id}/tax-attributions", token, method="PUT", body={
         "attributions": [{
             "sourceKind": "account",
@@ -463,10 +483,32 @@ def create_borrowing_browser_fixture(base: str, token: str, household_id: str, p
             "effectiveStart": start,
             "effectiveEnd": end,
             "notes": "Disposable SLED-180 fabricated taxable RRSP withdrawal attribution",
+        }, {
+            "sourceKind": "account",
+            "sourceId": non_registered_id,
+            "category": "realized_capital_gain",
+            "allocationMethod": "owner_share",
+            "effectiveStart": start,
+            "effectiveEnd": end,
+            "notes": "Disposable SLED-175 fabricated Non-Registered gain attribution",
+        }, {
+            "sourceKind": "account",
+            "sourceId": non_registered_id,
+            "category": "realized_capital_loss",
+            "allocationMethod": "owner_share",
+            "effectiveStart": start,
+            "effectiveEnd": end,
+            "notes": "Disposable SLED-175 fabricated Non-Registered loss attribution",
         }],
     })
-    if not any(item.get("sourceId") == rrsp_id and item.get("category") == "taxable_withdrawal" and item.get("effectiveStart") == start and item.get("effectiveEnd") == end for item in attributions.get("attributions", [])):
-        raise GateError(f"RRSP taxable-withdrawal attribution was not persisted: {attributions}")
+    persisted_attributions = attributions.get("attributions", [])
+    for account_id, category in ((rrsp_id, "taxable_withdrawal"),
+                                 (non_registered_id, "realized_capital_gain"),
+                                 (non_registered_id, "realized_capital_loss")):
+        if not any(item.get("sourceId") == account_id and item.get("category") == category
+                   and item.get("effectiveStart") == start and item.get("effectiveEnd") == end
+                   for item in persisted_attributions):
+            raise GateError(f"Dated {category} tax attribution for Account {account_id} was not persisted: {attributions}")
 
     profiles = request_json(base, f"/api/v1/people/{person_id}/tax-profiles", token, method="PUT", body={
         "profiles": [{"taxCountry": "CA", "taxRegion": "ON", "residencyStatus": "resident", "effectiveStart": start, "effectiveEnd": end,
@@ -507,9 +549,15 @@ def create_borrowing_browser_fixture(base: str, token: str, household_id: str, p
         "accountIds": {"chequing": chequing_id, "nonRegistered": non_registered_id, "rrsp": rrsp_id},
         "accountLabels": {"chequing": "Fixture Chequing", "nonRegistered": "Disposable Non-Registered", "rrsp": "Disposable RRSP"},
         "liabilityIds": {"creditLine": liability_id},
-        "cashflowIds": {"debtPayment": payment_id, "registeredContribution": contribution_id, "registeredWithdrawal": withdrawal_id},
+        "cashflowIds": {"debtPayment": payment_id, "registeredContribution": contribution_id,
+                        "registeredWithdrawal": withdrawal_id, "retirementSpending": retirement_spending_id},
         "basis": {"accountId": non_registered_id, "effectiveDate": start, "revision": 1, "amount": "180000.00"},
-        "expected": {"drawAmount": "5000.00", "annualRate": "0.06", "monthlyPayment": "250.00", "basisDate": start, "taxModelVersion": "ca-on-personal-tax-2026-v3-investment", "registeredWithdrawalAmount": "50000.00", "registeredWithdrawalMonthlyAmount": "4166.67", "registeredWithdrawalStartDate": "2060-01-01", "registeredContributionCandidateAmount": "2600000.00"},
+        "expected": {"drawAmount": "5000.00", "annualRate": "0.06", "monthlyPayment": "250.00", "basisDate": start,
+                     "taxModelVersion": "ca-on-personal-tax-2026-v3-investment", "registeredWithdrawalAmount": "50000.00",
+                     "registeredWithdrawalMonthlyAmount": "4166.67", "registeredWithdrawalStartDate": "2060-01-01",
+                     "retirementSpendingMonthlyAmount": "190000.00", "retirementFundingStartDate": "2080-01-01",
+                     "saleCostRate": "0.01", "saleCostAssumptionLabel": "Disposable SLED-175 automatic sale costs",
+                     "registeredContributionCandidateAmount": "2600000.00"},
         "snapshotHash": snapshot_hash,
     }
 
@@ -594,6 +642,156 @@ def assert_fixture_report(report: dict) -> None:
     expected = {"periodCount": 12, "openingNetWorth": "100000.10", "closingNetWorth": "100000.10"}
     if actual != expected:
         raise GateError(f"Scenario Run report does not match the fabricated fixture: expected {expected}, got {actual}.")
+
+
+def assert_taxable_funding_compilation(compilation: dict, account_id: str, *, basis_revision: int,
+                                       sale_cost_rate: str, sale_cost_label: str, start: str,
+                                       source_start: str, end: str) -> None:
+    content = compilation.get("content", {})
+    if not isinstance(content, dict):
+        raise GateError("Compiled Scenario input has no frozen content object.")
+    policy = content.get("retirementFundingPolicy", {})
+    sources = policy.get("sources", []) if isinstance(policy, dict) else []
+    source = next((item for item in sources if isinstance(item, dict) and item.get("accountId") == account_id), None)
+    if source is None:
+        raise GateError(f"Frozen retirement funding policy omitted Non-Registered Account {account_id}.")
+    if (source.get("fundingKind") != "taxable_sale" or source.get("saleCostRate") != sale_cost_rate
+            or source.get("saleCostAssumptionLabel") != sale_cost_label
+            or source.get("effectiveStart") != source_start or source.get("effectiveEnd") != end):
+        raise GateError(f"Frozen Non-Registered sale source does not preserve its reviewed cost assumptions: {source}")
+    basis_rows = content.get("portfolioBasis", [])
+    if not any(isinstance(item, dict) and item.get("accountId") == account_id
+               and item.get("revision") == basis_revision for item in basis_rows):
+        raise GateError(f"Frozen Scenario input did not pin Non-Registered cost-basis revision {basis_revision}: {basis_rows}")
+    attributions = content.get("taxAttributions", [])
+    for category in ("realized_capital_gain", "realized_capital_loss"):
+        if not any(isinstance(item, dict) and item.get("sourceId") == account_id
+                   and item.get("sourceKind") == "account" and item.get("allocationMethod") == "owner_share"
+                   and item.get("category") == category
+                   and item.get("effectiveStart") <= start and (item.get("effectiveEnd") is None or item.get("effectiveEnd") >= end)
+                   for item in attributions):
+            raise GateError(f"Frozen Scenario input omitted dated {category} owner-share attribution for Account {account_id}.")
+
+
+def assert_taxable_retirement_funding_report(report: dict, account_id: str) -> None:
+    periods = report.get("periods", [])
+    if not isinstance(periods, list) or not periods:
+        raise GateError("Taxable retirement funding Run report has no projected periods.")
+    trades: list[dict] = []
+    trade_ids: set[str] = set()
+    for period in periods:
+        if not isinstance(period, dict):
+            raise GateError("Taxable retirement funding Run report contains an invalid period.")
+        reconciliation = period.get("reconciliation", {})
+        if isinstance(reconciliation, dict):
+            for key in ("openingNetWorthResidual", "movementDeltaResidual", "closingNetWorthResidual"):
+                if key in reconciliation and reconciliation[key] != "0.00":
+                    raise GateError(f"Taxable retirement sale period is not reconciled: {period.get('periodStart')} {key}={reconciliation[key]!r}.")
+        for trade in period.get("portfolioTrades", []):
+            if isinstance(trade, dict) and trade.get("fundingSourceId"):
+                if trade.get("accountId") != account_id:
+                    raise GateError(f"Automatic retirement funding sale used an unexpected Account: {trade}")
+                trade_id = trade.get("id")
+                if not isinstance(trade_id, str) or not trade_id or trade_id in trade_ids:
+                    raise GateError(f"Automatic retirement funding trade has missing or duplicate identity: {trade}")
+                trade_ids.add(trade_id)
+                trades.append(trade)
+    funding_events = [event for event in report.get("fundingEvents", [])
+                      if isinstance(event, dict) and event.get("funded") not in (None, "0.00")]
+    if not trades:
+        raise GateError(f"Run report contains no generated retirement sale for Non-Registered Account {account_id}.")
+    if not funding_events:
+        raise GateError("Run report contains no funded retirement cash-deficit event.")
+    all_events = [event for event in report.get("fundingEvents", []) if isinstance(event, dict)]
+    spending_events = [event for event in all_events if event.get("purpose") == "retirement_spending"]
+    if not spending_events:
+        raise GateError("Run report contains no retirement-spending funding events.")
+    for event in spending_events:
+        try:
+            requested, funded, unfunded = (Decimal(event[key]) for key in ("requested", "funded", "unfunded"))
+        except (KeyError, InvalidOperation, TypeError) as error:
+            raise GateError(f"Retirement-spending funding event omits exact-money totals: {event}") from error
+        if funded != requested or unfunded != 0:
+            raise GateError(f"Terminal-year retirement-spending event was not fully funded: {event}")
+    tax_events = [event for event in all_events if event.get("purpose") == "tax_settlement"]
+    if not any(Decimal(event.get("unfunded", "0.00")) > 0 for event in tax_events):
+        raise GateError("Run report did not expose a positive unpaid year-end tax-settlement amount.")
+    purposes: set[str] = set()
+    has_costly_sale = False
+    has_depleted_sale = False
+    for trade in trades:
+        if trade.get("fundingPurpose") not in ("retirement_spending", "tax_settlement"):
+            raise GateError(f"Generated sale has missing or unsupported funding purpose: {trade}")
+        purposes.add(str(trade["fundingPurpose"]))
+        try:
+            gross = Decimal(trade["grossProceeds"])
+            costs = Decimal(trade["transactionCosts"])
+            basis = Decimal(trade["disposedBasis"])
+            gain = Decimal(trade["realizedGainLoss"])
+            net = Decimal(trade["netProceeds"])
+            closing_market = Decimal(trade["closingMarketValue"])
+            closing_basis = Decimal(trade["closingBasis"])
+        except (KeyError, InvalidOperation, TypeError) as error:
+            raise GateError(f"Generated sale omits an exact-money result field: {trade}") from error
+        if gross <= 0 or costs < 0 or costs > gross or basis < 0 or net != gross - costs or gain != net - basis:
+            raise GateError(f"Generated sale proceeds, fees, basis, and gain do not reconcile: {trade}")
+        if closing_market < 0 or closing_basis < 0:
+            raise GateError(f"Generated sale left a negative market value or pooled basis: {trade}")
+        has_costly_sale = has_costly_sale or costs > 0
+        has_depleted_sale = has_depleted_sale or closing_market == 0
+        allocations = trade.get("taxableByPerson", [])
+        try:
+            allocated_gain = sum((Decimal(item["amount"]) for item in allocations), Decimal(0))
+        except (InvalidOperation, TypeError, KeyError) as error:
+            raise GateError(f"Generated sale has malformed Person tax allocations: {trade}") from error
+        if allocated_gain != gain:
+            raise GateError(f"Generated sale Person gain/loss allocations do not reconcile: {trade}")
+    if purposes != {"retirement_spending", "tax_settlement"}:
+        raise GateError(f"Run report did not exercise both spending and year-end tax-funded sales: {sorted(purposes)}.")
+    if not has_costly_sale:
+        raise GateError("Run report did not apply the configured automatic-sale transaction-cost assumption.")
+    if not has_depleted_sale:
+        raise GateError("Run report did not expose full Non-Registered account depletion.")
+    if not any(trade.get("fundingPurpose") == "tax_settlement"
+               and trade.get("effectiveDate") == "2080-12-31"
+               and Decimal(trade["closingMarketValue"]) == 0
+               and Decimal(trade["closingBasis"]) == 0
+               for trade in trades):
+        raise GateError("Final-day tax-settlement sale did not fully deplete Non-Registered market value and basis.")
+
+
+def assert_taxable_retirement_funding_suite(detail: dict) -> None:
+    outcome = detail.get("outcome", {})
+    annual = outcome.get("annual", []) if isinstance(outcome, dict) else []
+    if not isinstance(annual, list):
+        raise GateError("Stress-suite candidate detail has no annual outcome rows.")
+    taxable_years = []
+    for row in annual:
+        if not isinstance(row, dict):
+            continue
+        try:
+            gross = Decimal(row.get("taxableSaleGrossProceeds", "0.00"))
+        except (InvalidOperation, TypeError) as error:
+            raise GateError(f"Stress-suite annual taxable-sale gross proceeds are invalid: {row}") from error
+        if gross <= 0:
+            continue
+        try:
+            costs = Decimal(row["taxableSaleTransactionCosts"])
+            basis = Decimal(row["taxableSaleBasisConsumed"])
+            gain = Decimal(row["taxableRealizedGainLoss"])
+            net = Decimal(row["taxableSaleNetProceeds"])
+        except (KeyError, InvalidOperation, TypeError) as error:
+            raise GateError(f"Stress-suite annual taxable-sale totals are incomplete: {row}") from error
+        if costs < 0 or basis < 0 or net != gross - costs or gain != net - basis:
+            raise GateError(f"Stress-suite annual taxable-sale totals do not reconcile: {row}")
+        for key in ("estimatedTax", "taxSettlementPaid", "taxRefundReceived", "remainingTaxDueOrRefund", "debtBalances"):
+            try:
+                Decimal(row[key])
+            except (KeyError, InvalidOperation, TypeError) as error:
+                raise GateError(f"Stress-suite annual taxable-sale outcome omits tax settlement or debt result {key}: {row}") from error
+        taxable_years.append(row.get("year"))
+    if not taxable_years:
+        raise GateError("Stress-suite candidate detail omitted the Non-Registered retirement sales from its annual outcomes.")
 
 
 def make_token(key_path: Path, issuer: str, audience: str) -> str:
@@ -1335,12 +1533,44 @@ def main() -> int:
                     or type(scenario_artifacts.get("compilationVersion")) is not int
                     or scenario_artifacts["compilationVersion"] < 1):
                 raise GateError(f"Real-browser Scenario test artifacts are incomplete: {scenario_artifacts}")
+            scenario_run_id = scenario_artifacts.get("runId")
+            if not isinstance(scenario_run_id, str) or not scenario_run_id:
+                raise GateError(f"Real-browser Scenario artifacts omitted the Run identity needed for taxable funding verification: {scenario_artifacts}")
+            scenario_compilation = request_json_local(
+                base,
+                f"/api/v1/households/{household_id}/scenarios/{scenario_artifacts['scenarioId']}/compiled-inputs/{scenario_artifacts['compilationVersion']}",
+            )
+            assert_taxable_funding_compilation(
+                scenario_compilation,
+                str(browser_fixture["accountIds"]["nonRegistered"]),
+                basis_revision=int(browser_fixture["basis"]["revision"]),
+                sale_cost_rate=str(browser_fixture["expected"]["saleCostRate"]),
+                sale_cost_label=str(browser_fixture["expected"]["saleCostAssumptionLabel"]),
+                start=str(browser_fixture["scenarioStartDate"]),
+                source_start=str(browser_fixture["expected"]["retirementFundingStartDate"]),
+                end=str(browser_fixture["scenarioEndDate"]),
+            )
+            scenario_report = request_json_local(
+                base,
+                f"/api/v1/households/{household_id}/scenarios/{scenario_artifacts['scenarioId']}/runs/{scenario_run_id}/results",
+            )
+            assert_taxable_retirement_funding_report(scenario_report, str(browser_fixture["accountIds"]["nonRegistered"]))
+            phase("browser-taxable-retirement-funding-report", "passed", runId=scenario_run_id,
+                  accountId=browser_fixture["accountIds"]["nonRegistered"])
             suite_artifacts = create_unfunded_contribution_suite(base, browser_fixture, scenario_artifacts)
             browser_fixture.update(suite_artifacts)
             browser_fixture_path.write_text(json.dumps(browser_fixture, indent=2, sort_keys=True) + "\n")
             phase("browser-scenario-compile-run", "passed", artifacts=scenario_artifacts)
 
             run_capability_browser(ui_path, base, browser_fixture_path, evidence, grep="@suite")
+            suite_identity = suite_artifacts["suite"]
+            suite_candidate_detail = request_json_local(
+                base,
+                f"/api/v1/households/{household_id}/scenarios/{suite_identity['scenarioId']}/stress-suites/{suite_identity['suiteId']}/candidates/{suite_identity['successCandidateId']}",
+            )
+            assert_taxable_retirement_funding_suite(suite_candidate_detail)
+            phase("browser-taxable-retirement-funding-suite-report", "passed",
+                  candidateId=suite_identity["successCandidateId"])
             manifest["browserFixture"] = browser_fixture
             phase("browser-suite-failure-and-reopen", "passed", artifacts=suite_artifacts,
                   browserArtifacts=str((evidence / "browser-artifacts" / "suite").resolve()))
